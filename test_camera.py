@@ -9,6 +9,19 @@ cap = cv2.VideoCapture(CAMERA_PATH)
 if not cap.isOpened():
     print("ERRORE: impossibile aprire la camera")
 else:
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    if getattr(config, "CAMERA_WIDTH", None):
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAMERA_WIDTH)
+    if getattr(config, "CAMERA_HEIGHT", None):
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
+    if getattr(config, "CAMERA_FPS", None):
+        cap.set(cv2.CAP_PROP_FPS, config.CAMERA_FPS)
+
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"Camera configurata: {actual_w}x{actual_h} @ {actual_fps:.1f} FPS")
+
     hands = mp.solutions.hands.Hands(max_num_hands=2, min_detection_confidence=0.5)
     n = 30
     t0 = time.time()

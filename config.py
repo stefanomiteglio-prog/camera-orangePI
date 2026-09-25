@@ -10,6 +10,11 @@ nel backend TreeEyes.
 CAMERA_INDEX = "/dev/v4l/by-id/usb-USB_Cam_Manufacturer_HDMI_USB_Camera_88901c069d01ae53-video-index0"         # Punta a /dev/video1 (HDMI USB Camera)
 # CAMERA_INDEX = "/dev/v4l/by-id/usb-Sonix_Technology_Co.__Ltd._USB_2.0_Camera_SN5100-video-index0"         # 0 = prima webcam disponibile. Cambia se usi una IP cam (vedi note in main.py)
 
+# Risoluzione acquisizione (720p per massima efficienza, alzare a 1920x1080 se serve più dettaglio)
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+CAMERA_FPS = 30
+
 # --- MQTT -----------------------------------------------------------------
 MQTT_ENABLED = True                  # Imposta a False per disabilitare MQTT (test offline)
 MQTT_BROKER_HOST = "10.88.91.108"    # indirizzo del tuo broker Mosquitto
