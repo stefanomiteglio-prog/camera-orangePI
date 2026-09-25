@@ -1,11 +1,182 @@
+import os
 import json
 import time
+from datetime import datetime, timezone
+from typing import Optional, Union, Any
 
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 import paho.mqtt.client as mqtt
 import requests
 
 import config
 from logger import logger
+
+
+# ============================================================
+# HTTP REST BACKEND CLIENT
+# ============================================================
+
+def verify_handshake(device_id: Optional[str] = None, backend_url: Optional[str] = None) -> bool:
+    """
+    Verifica all'avvio che la telecamera sia registrata ed attiva a sistema.
+
+    Endpoint: GET /devices/me (oppure GET /api/vision/me)
+    Header: X-MAC-Address: <TUO_MAC_ADDRESS>
+    """
+    mac = device_id or config.DEVICE_ID
+    base_url = backend_url or getattr(config, "BACKEND_HTTP_URL", f"http://{config.BACKEND_HTTP_HOST}:{config.BACKEND_HTTP_PORT}")
+    headers = {"X-MAC-Address": mac}
+    timeout = getattr(config, "HTTP_TIMEOUT_SECONDS", 10)
+
+    # Lista degli endpoint da testare (/devices/me e fallback a /api/vision/me)
+    endpoints = [
+        getattr(config, "BACKEND_ME_URL", f"{base_url}/devices/me"),
+        f"{base_url}/api/vision/me",
+        f"{base_url}/devices/me",
+    ]
+    # Rimuovi duplicati preservando l'ordine
+    unique_endpoints = list(dict.fromkeys(endpoints))
+
+    last_error = None
+    for url in unique_endpoints:
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                zone = data.get("zone", "Zona non specificata")
+                status = data.get("status", "ok")
+                dev_type = data.get("type", "camera")
+                logger.info(
+                    f"Handshake backend RIUSCITO ({url}): "
+                    f"Telecamera '{mac}' autorizzata per zona '{zone}' (status={status}, tipo={dev_type})"
+                )
+                return True
+            elif resp.status_code == 401:
+                logger.error(
+                    f"Handshake fallito (HTTP 401 Unauthorized): "
+                    f"Il MAC address '{mac}' non è censito nel database del backend!"
+                )
+                return False
+            elif resp.status_code == 403:
+                logger.error(
+                    f"Handshake fallito (HTTP 403 Forbidden): "
+                    f"Il dispositivo '{mac}' esiste ma non è configurato come 'camera'!"
+                )
+                return False
+            elif resp.status_code in (404, 405):
+                # Endpoint non trovato su questa rotta, prova il prossimo
+                continue
+            else:
+                last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+        except requests.exceptions.RequestException as e:
+            last_error = str(e)
+            break
+
+    if last_error:
+        logger.warning(
+            f"Handshake backend non completato ({last_error}). "
+            f"Il sistema continuerà in modalità autonoma."
+        )
+    return False
+
+
+def upload_snapshot(frame_or_path: Any, device_id: Optional[str] = None) -> Optional[str]:
+    """
+    Carica il frame JPG dell'evento sul backend per renderlo visibile nella dashboard.
+
+    Endpoint: POST /api/vision/snapshot
+    Header: X-MAC-Address: <TUO_MAC_ADDRESS>
+    Content-Type: multipart/form-data
+    Body: file binario immagine con chiave 'file' (es. snapshot.jpg)
+    Ritorna: URL pubblico della foto salvata (da inserire in 'frame_url' MQTT), oppure None in caso di errore.
+    """
+    mac = device_id or config.DEVICE_ID
+    url = getattr(config, "BACKEND_SNAPSHOT_URL", f"{config.BACKEND_HTTP_URL}/api/vision/snapshot")
+    headers = {"X-MAC-Address": mac}
+    timeout = getattr(config, "HTTP_TIMEOUT_SECONDS", 10)
+
+    try:
+        if isinstance(frame_or_path, str):
+            if not os.path.isfile(frame_or_path):
+                logger.error(f"File snapshot non trovato per upload: {frame_or_path}")
+                return None
+            with open(frame_or_path, "rb") as f:
+                image_bytes = f.read()
+            filename = os.path.basename(frame_or_path)
+        else:
+            # È un frame OpenCV (numpy ndarray)
+            if cv2 is None:
+                logger.error("OpenCV (cv2) non disponibile per codificare il frame in memoria.")
+                return None
+            success, encoded = cv2.imencode(".jpg", frame_or_path)
+            if not success:
+                logger.error("Codifica frame JPG fallita per upload snapshot.")
+                return None
+            image_bytes = encoded.tobytes()
+            filename = f"snapshot_{int(time.time())}.jpg"
+
+        files = {"file": (filename, image_bytes, "image/jpeg")}
+        resp = requests.post(url, headers=headers, files=files, timeout=timeout)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            snapshot_url = data.get("url")
+            logger.info(f"Snapshot caricato con successo: {snapshot_url}")
+            return snapshot_url
+        else:
+            logger.warning(f"Errore upload snapshot HTTP ({resp.status_code}): {resp.text[:200]}")
+            return None
+
+    except Exception as e:
+        logger.warning(f"Eccezione durante l'upload dello snapshot a {url}: {e}")
+        return None
+
+
+def upload_video_clip(clip_path: str, reason: str = "alert", device_id: Optional[str] = None) -> Optional[dict]:
+    """
+    Carica la clip video MP4 registrata sul backend.
+
+    Endpoint: POST /api/vision/clip
+    Header: X-MAC-Address: <TUO_MAC_ADDRESS>
+    Content-Type: multipart/form-data
+    Body: file video con chiave 'file' (es. clip.mp4)
+    """
+    mac = device_id or config.DEVICE_ID
+    url = getattr(config, "BACKEND_CLIP_URL", getattr(config, "BACKEND_VIDEO_UPLOAD_URL", f"{config.BACKEND_HTTP_URL}/api/vision/clip"))
+    headers = {"X-MAC-Address": mac}
+    timeout = getattr(config, "HTTP_TIMEOUT_SECONDS", 20)
+
+    if not os.path.isfile(clip_path):
+        logger.error(f"File clip video non trovato: {clip_path}")
+        return None
+
+    try:
+        with open(clip_path, "rb") as fh:
+            files = {"file": (os.path.basename(clip_path), fh, "video/mp4")}
+            data = {
+                "device_id": mac,
+                "event_type": reason,
+                "timestamp": int(time.time()),
+            }
+            resp = requests.post(url, headers=headers, files=files, data=data, timeout=timeout)
+
+        if resp.status_code == 200:
+            result = resp.json()
+            logger.info(
+                f"Clip video caricata con successo: {result.get('video_url')} "
+                f"(associata a evento ID: {result.get('event_id')})"
+            )
+            return result
+        else:
+            logger.warning(f"Errore upload clip video ({resp.status_code}): {resp.text[:200]}")
+            return None
+
+    except Exception as e:
+        logger.error(f"Eccezione durante l'upload della clip video a {url}: {e}")
+        return None
 
 
 # ============================================================
@@ -16,19 +187,24 @@ def build_mqtt_client():
     """
     Crea e connette il client MQTT della Vision Node.
 
-    Il device_id deve corrispondere al MAC address della
-    telecamera registrata nel backend.
+    Il device_id corrisponde al MAC address della telecamera.
     """
     if not getattr(config, "MQTT_ENABLED", True):
         logger.warning("MQTT disabilitato in config.py (modalità offline).")
         return None
 
-    client = mqtt.Client(
-        client_id=config.DEVICE_ID,
-        protocol=mqtt.MQTTv5,
-    )
+    try:
+        client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id=config.DEVICE_ID,
+            protocol=mqtt.MQTTv5,
+        )
+    except (AttributeError, TypeError):
+        client = mqtt.Client(
+            client_id=config.DEVICE_ID,
+            protocol=mqtt.MQTTv5,
+        )
 
-    # Autenticazione MQTT, se configurata
     mqtt_username = getattr(config, "MQTT_USERNAME", None)
     mqtt_password = getattr(config, "MQTT_PASSWORD", None)
 
@@ -44,109 +220,73 @@ def build_mqtt_client():
             config.MQTT_BROKER_PORT,
             keepalive=60,
         )
-
         client.loop_start()
 
         logger.info(
-            f"MQTT connesso a "
-            f"{config.MQTT_BROKER_HOST}:{config.MQTT_BROKER_PORT}"
+            f"MQTT connesso a {config.MQTT_BROKER_HOST}:{config.MQTT_BROKER_PORT}"
         )
-
-        logger.info(
-            f"Vision Node ID: {config.DEVICE_ID}"
-        )
-
-        logger.info(
-            f"MQTT topic eventi: {config.MQTT_TOPIC}"
-        )
+        logger.info(f"Vision Node MAC: {config.DEVICE_ID}")
+        logger.info(f"MQTT Topic allarmi: {config.MQTT_TOPIC}")
         return client
 
     except Exception as e:
-        logger.warning(f"Errore connessione MQTT ({e}): broker non raggiungibile. Il sistema continuerà in locale senza MQTT.")
+        logger.warning(
+            f"Errore connessione MQTT ({e}): broker non raggiungibile. "
+            f"Il sistema continuerà in locale senza MQTT."
+        )
         return None
 
 
 # ============================================================
-# PUBBLICAZIONE EVENTI
+# PUBBLICAZIONE EVENTI ALLARME
 # ============================================================
 
 def publish_event(
     mqtt_client,
-    danger_type,
-    confidence,
-    snapshot_path=None,
-    description=None,
+    danger_type: str,
+    confidence: float,
+    frame_url: Optional[str] = None,
+    description: Optional[str] = None,
 ):
     """
-    Pubblica un evento rilevato dalla telecamera.
+    Pubblica un allarme istantaneo via MQTT secondo la specifica:
 
-    Il payload è compatibile con il backend TreeEyes/FastAPI.
-
-    Formato:
-
+    Topic: parco/<DEVICE_ID>/camera
+    QoS: 1
+    Payload JSON:
     {
-        "device_id": "...",
-        "type": "alert",
-        "val_number": 1.0,
-        "alert_type": "rissa",
-        "confidence": 0.91,
-        "sampling_time": "...",
-        "frame_url": "...",
-        "description": "..."
+      "device_id": "c0:74:2b:fb:00:3f",
+      "type": "alert",
+      "val_number": 1,
+      "alert_type": "segnale_aiuto",
+      "confidence": 0.95,
+      "frame_url": "http://<IP_SERVER>:8000/static/snapshots/...",
+      "sampling_time": "2026-09-25T15:30:00Z"
     }
-
-    Il backend utilizza:
-      - device_id      -> MAC address della camera
-      - type           -> tipo di Event
-      - val_number     -> valore numerico dell'evento
-      - alert_type     -> tipo specifico di pericolo
-      - confidence     -> confidenza AI
-      - frame_url      -> riferimento allo snapshot
     """
-
-    # Timestamp UTC in formato ISO 8601
-    sampling_time = time.strftime(
-        "%Y-%m-%dT%H:%M:%S+00:00",
-        time.gmtime(),
-    )
+    sampling_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     payload = {
-        # Deve essere il MAC address registrato nel backend
         "device_id": config.DEVICE_ID,
-
-        # Il backend si aspetta un Event di tipo alert
         "type": "alert",
-
-        # Evento binario: allarme presente
-        "val_number": 1.0,
-
-        # Tipo specifico di pericolo
-        # es. rissa, arma, persona_a_terra, vandalismo...
+        "val_number": 1,
         "alert_type": danger_type,
-
-        # Confidenza del modello AI
         "confidence": round(float(confidence), 2),
-
-        # Momento in cui l'evento è stato rilevato
         "sampling_time": sampling_time,
-
-        # Snapshot associato all'evento
-        "frame_url": snapshot_path,
-
-        # Descrizione eventualmente prodotta dal VLM
-        "description": description,
     }
 
+    if frame_url:
+        payload["frame_url"] = frame_url
+
+    if description:
+        payload["description"] = description
+
     if mqtt_client is None:
-        logger.debug(f"MQTT offline: evento {danger_type} non inviato al broker.")
+        logger.debug(f"MQTT offline: allarme {danger_type} non inviato al broker.")
         return False
 
     try:
-        message = json.dumps(
-            payload,
-            ensure_ascii=False,
-        )
-
+        message = json.dumps(payload, ensure_ascii=False)
         result = mqtt_client.publish(
             config.MQTT_TOPIC,
             message,
@@ -154,28 +294,17 @@ def publish_event(
         )
 
         if result.rc != mqtt.MQTT_ERR_SUCCESS:
-            logger.error(
-                f"Errore pubblicazione MQTT "
-                f"(rc={result.rc})"
-            )
+            logger.error(f"Errore pubblicazione MQTT (rc={result.rc})")
             return False
 
         logger.info(
-            f"Evento pubblicato: "
-            f"{danger_type} "
-            f"(confidence={float(confidence):.2f})"
+            f"Allarme MQTT inviato: {danger_type} (conf={float(confidence):.2f}, frame_url={frame_url})"
         )
-
-        logger.debug(
-            f"MQTT payload: {message}"
-        )
-
+        logger.debug(f"MQTT payload: {message}")
         return True
 
     except Exception as e:
-        logger.error(
-            f"Errore pubblicazione evento MQTT: {e}"
-        )
+        logger.error(f"Errore pubblicazione evento MQTT: {e}")
         return False
 
 
@@ -183,74 +312,31 @@ def publish_event(
 # TELEGRAM
 # ============================================================
 
-def notify_telegram(message):
+def notify_telegram(message: str):
     """
-    Invia una notifica Telegram se Telegram è abilitato.
-
-    Se Telegram è disabilitato, la funzione non fa nulla.
-
-    Questa parte rimane indipendente dall'invio MQTT:
-    un eventuale errore Telegram non deve impedire
-    la pubblicazione dell'evento al backend.
+    Invia una notifica Telegram opzionale se abilitata in config.py.
     """
-
-    telegram_enabled = getattr(
-        config,
-        "TELEGRAM_ENABLED",
-        False,
-    )
-
+    telegram_enabled = getattr(config, "TELEGRAM_ENABLED", False)
     if not telegram_enabled:
         return False
 
-    bot_token = getattr(
-        config,
-        "TELEGRAM_BOT_TOKEN",
-        None,
-    )
-
-    chat_id = getattr(
-        config,
-        "TELEGRAM_CHAT_ID",
-        None,
-    )
+    bot_token = getattr(config, "TELEGRAM_BOT_TOKEN", None)
+    chat_id = getattr(config, "TELEGRAM_CHAT_ID", None)
 
     if not bot_token or not chat_id:
-        logger.warning(
-            "Telegram abilitato ma "
-            "TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID non configurati."
-        )
+        logger.warning("Telegram abilitato ma TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID mancanti.")
         return False
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{bot_token}/sendMessage"
-    )
-
-    data = {
-        "chat_id": chat_id,
-        "text": message,
-    }
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    data = {"chat_id": chat_id, "text": message}
 
     try:
-        response = requests.post(
-            url,
-            data=data,
-            timeout=10,
-        )
-
+        response = requests.post(url, data=data, timeout=10)
         if response.ok:
-            logger.info("Notifica Telegram inviata.")
+            logger.info("Notifica Telegram inviata con successo.")
             return True
-
-        logger.warning(
-            f"Errore Telegram: "
-            f"HTTP {response.status_code}"
-        )
-
+        logger.warning(f"Errore Telegram: HTTP {response.status_code}")
     except Exception as e:
-        logger.warning(
-            f"Errore invio Telegram: {e}"
-        )
+        logger.warning(f"Errore invio notifica Telegram: {e}")
 
     return False

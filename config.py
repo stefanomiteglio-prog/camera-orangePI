@@ -15,13 +15,31 @@ CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CAMERA_FPS = 30
 
+# --- Identificazione Dispositivo (MAC Address) ----------------------------
+# Deve corrispondere al MAC address censito nel backend (es. c0:74:2b:fb:00:3f o mini_cam_01)
+DEVICE_ID = "c0:74:2b:fb:00:3f"
+
+# --- Backend HTTP REST ---------------------------------------------------
+# Host Backend HTTP: http://<IP_SERVER>:8000 (o porta 5173 se tramite reverse-proxy)
+BACKEND_HTTP_HOST = "10.88.91.108"
+BACKEND_HTTP_PORT = 8000
+BACKEND_HTTP_URL = f"http://{BACKEND_HTTP_HOST}:{BACKEND_HTTP_PORT}"
+
+# Endpoint specifici per la telecamera
+BACKEND_ME_URL = f"{BACKEND_HTTP_URL}/devices/me"           # Handshake/autorizzazione (o /api/vision/me)
+BACKEND_SNAPSHOT_URL = f"{BACKEND_HTTP_URL}/api/vision/snapshot" # Upload snapshot JPG anteprima
+BACKEND_CLIP_URL = f"{BACKEND_HTTP_URL}/api/vision/clip"         # Upload clip MP4 registrata
+BACKEND_VIDEO_UPLOAD_URL = BACKEND_CLIP_URL                 # Retrocompatibilità
+
+# Timeout richieste HTTP in secondi
+HTTP_TIMEOUT_SECONDS = 10
+
 # --- MQTT -----------------------------------------------------------------
 MQTT_ENABLED = True                  # Imposta a False per disabilitare MQTT (test offline)
-MQTT_BROKER_HOST = "10.88.91.108"    # indirizzo del tuo broker Mosquitto
-# MQTT_BROKER_HOST = "10.88.91.27"
+MQTT_BROKER_HOST = "10.88.91.108"    # Indirizzo del broker Mosquitto
 MQTT_BROKER_PORT = 1883
-MQTT_TOPIC = "treeeyes/parco-robinson/vision/events"
-DEVICE_ID = "vision-node-01"       # identifica questo nodo come faresti con un ESP32
+# Topic conforme allo standard Parco: parco/<DEVICE_ID>/camera (oppure parco/<DEVICE_ID>/events)
+MQTT_TOPIC = f"parco/{DEVICE_ID}/camera"
 
 # --- Telegram (opzionale, riusa il bot che hai gia') ----------------------
 TELEGRAM_ENABLED = False           # metti True quando hai token e chat_id
@@ -50,7 +68,16 @@ DANGER_CLASS_MAP = {
 # Numero di frame consecutivi in cui il pericolo deve essere rilevato
 # prima di generare un evento, per ridurre i falsi positivi.
 CONSECUTIVE_FRAMES_THRESHOLD = 5
-EVENT_COOLDOWN_SECONDS = 30
+
+EVENT_COOLDOWN_SECONDS = 5
+EVENT_COOLDOWN_MAP = {
+    "segnale_aiuto": 5,             # Cooldown 5s per gesto aiuto (specifica)
+    "arma": 10,
+    "rissa": 10,
+    "persona_a_terra": 10,
+    "vandalismo": 10,
+    "assembramento": 30,
+}
 
 FALL_ASPECT_RATIO = 1.4
 FALL_TORSO_ANGLE_DEG = 55
@@ -88,12 +115,10 @@ HELP_GESTURE_WINDOW_SECONDS = 4
 HELP_GESTURE_TUCK_RATIO = 0.35
 
 VIDEO_CLIP_ENABLED = True
-VIDEO_CLIP_PRE_SECONDS = 10
-VIDEO_CLIP_POST_SECONDS = 10
+VIDEO_CLIP_PRE_SECONDS = 5          # Buffer 5s prima dell'evento
+VIDEO_CLIP_POST_SECONDS = 5         # Buffer 5s dopo l'evento (3-5s da specifiche)
 VIDEO_CLIP_DIR = "clips"
 VIDEO_CLIP_TRIGGER_TYPES = {"rissa", "arma", "persona_a_terra", "vandalismo", "fuoco_fumo", "segnale_aiuto"}
-BACKEND_VIDEO_UPLOAD_URL = "http://10.88.91.108:8000/api/vision/clip"
-# BACKEND_VIDEO_UPLOAD_URL = "http://10.88.91.27:8000/api/vision/clip"
 
 VLM_ENABLED = True
 VLM_ENDPOINT = "http://localhost:11434/api/generate"

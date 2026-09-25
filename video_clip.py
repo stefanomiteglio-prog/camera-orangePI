@@ -66,17 +66,7 @@ class ClipRecorder:
         logger.info(f"Clip salvata {path} ({len(frames)} frame, ~{fps:.1f} fps, {duration:.1f}s)")
 
         try:
-            with open(path, "rb") as fh:
-                requests.post(
-                    config.BACKEND_VIDEO_UPLOAD_URL,
-                    files={"video": fh},
-                    data={
-                        "device_id": config.DEVICE_ID,
-                        "event_type": reason,
-                        "timestamp": int(time.time()),
-                    },
-                    timeout=15,
-                )
-            logger.info("Clip caricata sul backend.")
+            from events import upload_video_clip
+            upload_video_clip(path, reason=reason)
         except Exception as e:
-            logger.error(f"Errore upload clip: {e}")
+            logger.error(f"Errore upload clip video: {e}")

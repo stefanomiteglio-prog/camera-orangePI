@@ -5,7 +5,13 @@ import threading
 import cv2
 
 import config
-from events import build_mqtt_client, publish_event, notify_telegram
+from events import (
+    build_mqtt_client,
+    publish_event,
+    notify_telegram,
+    verify_handshake,
+    upload_snapshot,
+)
 import pose_heuristics as ph
 import hand_gesture as hg
 import hud
@@ -20,26 +26,53 @@ DETECT_RKNN_PATH = "rknn_test/rknn_model_zoo/examples/yolov8/model/yolov8n.rknn"
 RKNN_TARGET = "rk3588"
 
 
-def _confirm_and_publish(danger_type, confidence, snapshot_path, mqtt_client):
-    confirmed, description = vlm_confirm.confirm(snapshot_path, danger_type)
-    if not confirmed:
-        logger.info(f"Evento {danger_type} scartato dal VLM (falso positivo): {description}")
-        return
+def _process_event_async(danger_type, confidence, snapshot_path, frame, mqtt_client):
+    """
+    Gestisce l'upload dello snapshot HTTP e l'invio dell'allarme MQTT in background,
+    senza bloccare il loop di cattura ed inferenza video.
+    """
+    # 1. Carica snapshot JPG al backend per ottenere l'URL pubblico (frame_url)
+    frame_url = upload_snapshot(frame if frame is not None else snapshot_path)
+
+    description = ""
+    # 2. VLM confirmation se abilitato (saltato per 'segnale_aiuto' per garantire reattività immediata)
+    if config.VLM_ENABLED and danger_type != "segnale_aiuto":
+        confirmed, description = vlm_confirm.confirm(snapshot_path, danger_type)
+        if not confirmed:
+            logger.info(f"Evento {danger_type} scartato dal VLM (falso positivo): {description}")
+            return
+
+    # 3. Pubblica allarme istantaneo via MQTT sul topic parco/<MAC>/camera con frame_url
+    publish_event(
+        mqtt_client=mqtt_client,
+        danger_type=danger_type,
+        confidence=confidence,
+        frame_url=frame_url,
+        description=description,
+    )
+
+    # 4. Notifica Telegram opzionale
     label = f"{danger_type} - {description}" if description else danger_type
-    publish_event(mqtt_client, danger_type, confidence, snapshot_path, description)
-    notify_telegram(f"⚠️ TreeEyes - {label} - Parco Robinson")
+    notify_telegram(f"⚠️ TreeEyes - {label} (Camera: {config.DEVICE_ID})")
 
 
 def fire_event(now, danger_type, confidence, frame, mqtt_client, last_event_time, clip):
-    if now - last_event_time.get(danger_type, 0) < config.EVENT_COOLDOWN_SECONDS:
+    cooldown = getattr(config, "EVENT_COOLDOWN_MAP", {}).get(danger_type, config.EVENT_COOLDOWN_SECONDS)
+    if now - last_event_time.get(danger_type, 0) < cooldown:
         return False
-    snapshot_path = f"snapshots/{danger_type}_{int(now)}.jpg"
-    cv2.imwrite(snapshot_path, frame)
+
     last_event_time[danger_type] = now
+    os.makedirs("snapshots", exist_ok=True)
+    snapshot_path = f"snapshots/{danger_type}_{int(now)}.jpg"
+    frame_copy = frame.copy()
+    cv2.imwrite(snapshot_path, frame_copy)
+
+    # Avvia buffer di registrazione video (3-5s post-evento)
     clip.trigger(danger_type)
+
     threading.Thread(
-        target=_confirm_and_publish,
-        args=(danger_type, confidence, snapshot_path, mqtt_client),
+        target=_process_event_async,
+        args=(danger_type, confidence, snapshot_path, frame_copy, mqtt_client),
         daemon=True,
     ).start()
     return True
@@ -81,6 +114,10 @@ def main():
     cap = open_capture()
     consecutive_failures = 0
 
+    # 1. Handshake di autenticazione e autorizzazione con il backend centrale HTTP
+    verify_handshake()
+
+    # 2. Connessione broker MQTT per allarmi in tempo reale
     mqtt_client = build_mqtt_client()
     clip = ClipRecorder()
 
