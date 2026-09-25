@@ -1,0 +1,25 @@
+# Ambienti virtuali e cache Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Log e file temporanei
+logs/
+*.log
+
+# Output generati da test ed esecuzioni
+clips/
+snapshots/
+rknn_test/
+pose_test_out.jpg
+
+# Pesi e modelli YOLO / RKNN (grandi o rigenerabili)
+yolov8*.pt
+*.rknn
+
+# Modelli serializzati: rimuovi questa riga se vuoi versionare il classificatore addestrato
+gesture_classifier.pkl
+
+# Configurazione locale: mantieni questa riga solo se config.py contiene segreti o impostazioni personali
+# config.py
