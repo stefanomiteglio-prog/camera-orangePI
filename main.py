@@ -233,8 +233,9 @@ def main():
         cv2.destroyAllWindows()
         detect_model.release()
         pose_model.release()
-        mqtt_client.loop_stop()
-        mqtt_client.disconnect()
+        if mqtt_client is not None:
+            mqtt_client.loop_stop()
+            mqtt_client.disconnect()
 
 
 if __name__ == "__main__":

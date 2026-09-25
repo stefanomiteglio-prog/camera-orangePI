@@ -19,6 +19,9 @@ def build_mqtt_client():
     Il device_id deve corrispondere al MAC address della
     telecamera registrata nel backend.
     """
+    if not getattr(config, "MQTT_ENABLED", True):
+        logger.warning("MQTT disabilitato in config.py (modalità offline).")
+        return None
 
     client = mqtt.Client(
         client_id=config.DEVICE_ID,
@@ -56,12 +59,11 @@ def build_mqtt_client():
         logger.info(
             f"MQTT topic eventi: {config.MQTT_TOPIC}"
         )
+        return client
 
     except Exception as e:
-        logger.error(f"Errore connessione MQTT: {e}")
-        raise
-
-    return client
+        logger.warning(f"Errore connessione MQTT ({e}): broker non raggiungibile. Il sistema continuerà in locale senza MQTT.")
+        return None
 
 
 # ============================================================
@@ -134,6 +136,10 @@ def publish_event(
         # Descrizione eventualmente prodotta dal VLM
         "description": description,
     }
+
+    if mqtt_client is None:
+        logger.debug(f"MQTT offline: evento {danger_type} non inviato al broker.")
+        return False
 
     try:
         message = json.dumps(

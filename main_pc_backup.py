@@ -218,8 +218,9 @@ def main():
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        mqtt_client.loop_stop()
-        mqtt_client.disconnect()
+        if mqtt_client is not None:
+            mqtt_client.loop_stop()
+            mqtt_client.disconnect()
 
 
 if __name__ == "__main__":

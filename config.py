@@ -11,7 +11,9 @@ CAMERA_INDEX = "/dev/v4l/by-id/usb-USB_Cam_Manufacturer_HDMI_USB_Camera_88901c06
 # CAMERA_INDEX = "/dev/v4l/by-id/usb-Sonix_Technology_Co.__Ltd._USB_2.0_Camera_SN5100-video-index0"         # 0 = prima webcam disponibile. Cambia se usi una IP cam (vedi note in main.py)
 
 # --- MQTT -----------------------------------------------------------------
-MQTT_BROKER_HOST = "10.88.91.27"     # indirizzo del tuo broker Mosquitto
+MQTT_ENABLED = True                  # Imposta a False per disabilitare MQTT (test offline)
+MQTT_BROKER_HOST = "10.88.91.108"    # indirizzo del tuo broker Mosquitto
+# MQTT_BROKER_HOST = "10.88.91.27"
 MQTT_BROKER_PORT = 1883
 MQTT_TOPIC = "treeeyes/parco-robinson/vision/events"
 DEVICE_ID = "vision-node-01"       # identifica questo nodo come faresti con un ESP32
@@ -85,7 +87,8 @@ VIDEO_CLIP_PRE_SECONDS = 10
 VIDEO_CLIP_POST_SECONDS = 10
 VIDEO_CLIP_DIR = "clips"
 VIDEO_CLIP_TRIGGER_TYPES = {"rissa", "arma", "persona_a_terra", "vandalismo", "fuoco_fumo", "segnale_aiuto"}
-BACKEND_VIDEO_UPLOAD_URL = "http://10.88.91.27:8000/api/vision/clip"
+BACKEND_VIDEO_UPLOAD_URL = "http://10.88.91.108:8000/api/vision/clip"
+# BACKEND_VIDEO_UPLOAD_URL = "http://10.88.91.27:8000/api/vision/clip"
 
 VLM_ENABLED = True
 VLM_ENDPOINT = "http://localhost:11434/api/generate"
