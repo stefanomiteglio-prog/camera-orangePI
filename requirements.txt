@@ -1,11 +1,15 @@
-# IMPORTANTE: installa PRIMA torch/torchvision con supporto CUDA seguendo
-# le istruzioni nel README (la RTX 50-series richiede CUDA 12.8+), POI questo file.
+# Dipendenze principali nodo visione
 ultralytics>=8.3.0
 opencv-python>=4.10.0
 paho-mqtt>=2.1.0
 numpy>=1.26.0
+mediapipe==0.10.14
+requests>=2.32.0
+
+# Runtime NPU Rockchip (per Orange Pi / RK3588 con rknnlite)
+rknn-toolkit-lite2>=2.0.0
+
+# Modulo opzionale audio (audio_node.py)
 sounddevice>=0.5.0
 panns-inference>=0.1.1
 openai-whisper>=20240930
-mediapipe==0.10.14
-requests>=2.32.0
