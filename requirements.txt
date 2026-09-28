@@ -1,10 +1,16 @@
 # Dipendenze principali nodo visione
-ultralytics>=8.3.0
-opencv-python>=4.10.0
-paho-mqtt>=2.1.0
-numpy>=1.26.0
-mediapipe==0.10.14
-requests>=2.32.0
+ultralytics>=8.0.0; python_version >= '3.8'
+opencv-python>=4.6.0
+paho-mqtt>=1.6.1
+requests>=2.28.0
+
+# NumPy: su Python 3.8 l'ultima versione disponibile è 1.24.4
+numpy>=1.21.0,<=1.24.4; python_version < '3.9'
+numpy>=1.26.0; python_version >= '3.9'
+
+# MediaPipe: su Python 3.8 l'ultima versione compatibile è 0.10.9
+mediapipe<=0.10.9; python_version < '3.9'
+mediapipe>=0.10.14; python_version >= '3.9'
 
 # Runtime NPU Rockchip (per Orange Pi / RK3588 con rknnlite)
 rknn-toolkit-lite2>=2.0.0
