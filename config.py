@@ -21,7 +21,7 @@ DEVICE_ID = "c0:74:2b:fb:00:3f"
 
 # --- Backend HTTP REST ---------------------------------------------------
 # Host Backend HTTP: http://<IP_SERVER>:8000 (o porta 5173 se tramite reverse-proxy)
-BACKEND_HTTP_HOST = "10.88.91.108"
+BACKEND_HTTP_HOST = "192.168.88.199"
 BACKEND_HTTP_PORT = 8000
 BACKEND_HTTP_URL = f"http://{BACKEND_HTTP_HOST}:{BACKEND_HTTP_PORT}"
 
@@ -36,7 +36,7 @@ HTTP_TIMEOUT_SECONDS = 10
 
 # --- MQTT -----------------------------------------------------------------
 MQTT_ENABLED = True                  # Imposta a False per disabilitare MQTT (test offline)
-MQTT_BROKER_HOST = "10.88.91.108"    # Indirizzo del broker Mosquitto
+MQTT_BROKER_HOST = "192.168.88.199"    # Indirizzo del broker Mosquitto
 MQTT_BROKER_PORT = 1883
 # Topic conforme allo standard Parco: parco/<DEVICE_ID>/camera (oppure parco/<DEVICE_ID>/events)
 MQTT_TOPIC = f"parco/{DEVICE_ID}/camera"
