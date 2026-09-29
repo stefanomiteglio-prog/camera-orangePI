@@ -117,8 +117,24 @@ def main():
     last_event_time: dict[str, float] = {}
     crowd_start_time: float | None = None
 
-    logger.info("Avvio. Premi 'q' per uscire.")
+    window_name = getattr(config, "WINDOW_NAME", "TreeEyes - Vision Node")
+    is_fullscreen = getattr(config, "WINDOW_FULLSCREEN", True)
+    monitor_x = getattr(config, "WINDOW_MONITOR_X", 0)
+    monitor_y = getattr(config, "WINDOW_MONITOR_Y", 0)
 
+    if not getattr(config, "HEADLESS", False):
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        if monitor_x != 0 or monitor_y != 0:
+            cv2.moveWindow(window_name, monitor_x, monitor_y)
+        if is_fullscreen:
+            cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+    logger.info(
+        f"Avvio completato. FULLSCREEN={is_fullscreen} (Monitor X={monitor_x}, Y={monitor_y}). "
+        f"Controlli: 'q'/ESC esci, 'f' toggle fullscreen, 'r' reset allarmi."
+    )
+
+    frame_idx = 0
     try:
         while True:
             ok, frame = cap.read()
@@ -175,13 +191,12 @@ def main():
                     if consecutive_counts["fuoco_fumo"] >= config.CONSECUTIVE_FRAMES_THRESHOLD:
                         fire_event(now, "fuoco_fumo", confidence, frame, mqtt_client, last_event_time, clip)
 
-            # --- Stadio 2: pose, tracking, caduta, rissa, vandalismo ---
+            # --- Stadio 2: pose, tracking e caduta ---
             pose_results = pose_model.track(
                 frame, conf=config.CONF_THRESHOLD, device=config.DEVICE,
                 persist=True, verbose=False, tracker="botsort_reid.yaml",
             )[0]
 
-            people = []
             if pose_results.boxes is not None and pose_results.boxes.id is not None:
                 for box, kp, track_id in zip(pose_results.boxes, pose_results.keypoints, pose_results.boxes.id):
                     track_id = int(track_id)
@@ -196,33 +211,8 @@ def main():
                         detected_this_frame.add("persona_a_terra")
                         consecutive_counts["persona_a_terra"] = consecutive_counts.get("persona_a_terra", 0) + 1
 
-                    motion, wrist_motion = ph.update_motion(track_id, keypoints)
-                    center = ph.person_center(xyxy)
-                    diag = ph.person_diag(xyxy)
-                    people.append((center, motion, diag))
-
-                    wrist_ratio = wrist_motion / diag
-                    if ph.in_zone(center, config.PROTECTED_ZONE):
-                        cv2.putText(frame, f"vandal ratio: {wrist_ratio:.2f}", (x1, y2 + 18),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                        if wrist_ratio >= config.VANDAL_WRIST_RATIO_THRESHOLD:
-                            detected_this_frame.add("vandalismo")
-                            consecutive_counts["vandalismo"] = consecutive_counts.get("vandalismo", 0) + 1
-
-            zx1, zy1, zx2, zy2 = config.PROTECTED_ZONE
-            cv2.rectangle(frame, (zx1, zy1), (zx2, zy2), (0, 255, 255), 1)
-
-            if ph.is_fighting(people):
-                detected_this_frame.add("rissa")
-                consecutive_counts["rissa"] = consecutive_counts.get("rissa", 0) + 1
-
-            for danger_type, threshold in (
-                ("persona_a_terra", config.CONSECUTIVE_FRAMES_THRESHOLD),
-                ("rissa", config.CONSECUTIVE_FRAMES_THRESHOLD),
-                ("vandalismo", config.VANDAL_FRAMES_THRESHOLD),
-            ):
-                if danger_type in detected_this_frame and consecutive_counts.get(danger_type, 0) >= threshold:
-                    fire_event(now, danger_type, 1.0, frame, mqtt_client, last_event_time, clip)
+            if "persona_a_terra" in detected_this_frame and consecutive_counts.get("persona_a_terra", 0) >= config.CONSECUTIVE_FRAMES_THRESHOLD:
+                fire_event(now, "persona_a_terra", 1.0, frame, mqtt_client, last_event_time, clip)
 
             for danger_type in list(consecutive_counts.keys()):
                 if danger_type not in detected_this_frame:
@@ -251,21 +241,35 @@ def main():
             hud.draw_panel(frame, [
                 ("Persone", False, f"({person_count})"),
                 ("Caduta", "persona_a_terra" in detected_this_frame, ""),
-                ("Rissa", "rissa" in detected_this_frame, ""),
-                ("Vandalismo", "vandalismo" in detected_this_frame, ""),
                 ("Assembramento", crowd_start_time is not None, ""),
                 ("Gesto aiuto", gesture_triggered, ""),
             ], recording=clip.is_recording())
 
-            cv2.imshow("TreeEyes - Vision Node (debug)", frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            if key == ord("r"):
-                last_event_time.clear()
-                consecutive_counts.clear()
-                crowd_start_time = None
-                logger.info("Reset manuale cooldown/contatori (demo).")
+            if not getattr(config, "HEADLESS", False):
+                cv2.imshow(window_name, frame)
+                if frame_idx == 1:
+                    if monitor_x != 0 or monitor_y != 0:
+                        cv2.moveWindow(window_name, monitor_x, monitor_y)
+                    if is_fullscreen:
+                        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q") or key == 27:
+                    break
+                if key == ord("r"):
+                    last_event_time.clear()
+                    consecutive_counts.clear()
+                    crowd_start_time = None
+                    logger.info("Reset manuale cooldown/contatori (demo).")
+                if key in (ord("f"), ord("F")):
+                    is_fullscreen = not is_fullscreen
+                    prop = cv2.WINDOW_FULLSCREEN if is_fullscreen else cv2.WINDOW_NORMAL
+                    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, prop)
+                    if not is_fullscreen:
+                        if monitor_x != 0 or monitor_y != 0:
+                            cv2.moveWindow(window_name, monitor_x, monitor_y)
+                        cv2.resizeWindow(window_name, 1280, 720)
+                    logger.info(f"Fullscreen: {'ATTIVATO' if is_fullscreen else 'DISATTIVATO'}")
 
     finally:
         cap.release()

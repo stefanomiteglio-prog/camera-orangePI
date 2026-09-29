@@ -39,12 +39,10 @@ rilevati, utile per calibrare `CONF_THRESHOLD` e `CONSECUTIVE_FRAMES_THRESHOLD`.
 ## Stadio 2 (fatto)
 
 - ✅ Tracking di sessione (ByteTrack, ID temporaneo per persona)
-- ✅ Persona a terra (euristica bounding box larga/bassa)
-- ✅ Rissa (due persone vicine con movimento keypoint alto)
+- ✅ Persona a terra (angolo del busto e aspect ratio)
 
 ## Stadio 3 (fatto)
 
-- ✅ Vandalismo: zona protetta (`PROTECTED_ZONE` in config.py) + movimento sostenuto dentro
 - ✅ Assembramento sospetto: conteggio persone sopra soglia per N secondi
 
 ## Fuoco/fumo
@@ -88,22 +86,28 @@ associato il gesto alla persona più vicina tramite le coordinate).
 ## Precisione migliorata
 
 - Caduta: non solo aspect ratio del box, ma angolo del busto (spalle-anche) — più robusto
-- Rissa/vandalismo: movimento normalizzato sulla taglia della persona (invariante alla distanza dalla camera) + media mobile per ridurre rumore
 - Gesto aiuto: soglie normalizzate sulla diagonale della mano (invariante alla distanza), richiede palmo aperto stabile prima del pugno
 
-## HUD di stato (per l'esposizione)
+## HUD di stato e Finestra a Schermo Intero
 
 Pannello in alto a sinistra mostra live lo stato di ogni rilevatore (verde=ok,
 rosso=attivo), il conteggio persone, e una barra di progresso per il gesto
 aiuto. Indicatore REC in alto a destra quando sta registrando una clip.
 
-## Clip video 10s prima + 10s dopo
+### Gestione Finestra e Monitor (config.py):
+- `WINDOW_FULLSCREEN = True`: avvia il programma direttamente a schermo intero.
+- `WINDOW_MONITOR_X` / `WINDOW_MONITOR_Y`: seleziona su quale monitor proiettare la finestra (es. `WINDOW_MONITOR_X = 1920` per il secondo monitor HDMI).
+- Tasti interattivi a runtime:
+  - `f`: Attiva/disattiva schermo intero al volo (toggle fullscreen).
+  - `q` / `ESC`: Chiude l'applicazione.
+  - `r`: Reset manuale dei contatori e cooldown degli eventi.
 
-Ogni evento rilevante (rissa, arma, caduta, vandalismo, fuoco/fumo, segnale
-aiuto) salva automaticamente una clip `.mp4` con 10s prima dell'evento (da un
-buffer circolare sempre attivo) e 10s dopo, poi la carica sul backend via
-HTTP POST a `BACKEND_VIDEO_UPLOAD_URL` (config.py — imposta l'endpoint reale
-del tuo backend). Le clip restano anche salvate in `clips/`.
+## Clip video 5s prima + 5s dopo
+
+Ogni evento rilevante (arma, caduta, fuoco/fumo, segnale aiuto, assembramento)
+salva automaticamente una clip `.mp4` con buffer circolare pre-evento e post-evento,
+poi la carica sul backend via HTTP POST a `BACKEND_CLIP_URL`.
+Le clip restano anche salvate in `clips/`.
 
 ## Robustezza per l'esposizione
 
@@ -117,9 +121,8 @@ del tuo backend). Le clip restano anche salvate in `clips/`.
 Quando un'euristica rileva un pericolo, prima di notificare/creare la pratica,
 la foto viene mandata a un modello di visione locale (via Ollama) che risponde
 in linguaggio naturale se il pericolo è reale e lo descrive. Filtra i falsi
-positivi delle euristiche e arricchisce la notifica con una descrizione umana
-(es. "una persona sta scuotendo violentemente il cestino" invece di solo
-"vandalismo"). Gira in background, non rallenta il video.
+positivi delle euristiche e arricchisce la notifica con una descrizione umana.
+Gira in background, non rallenta il video.
 
 Setup:
 1. Installa [Ollama](https://ollama.com/download) (Windows/Mac/Linux)
@@ -134,7 +137,5 @@ e imposta `VLM_MODEL = "moondream"` in config.py.
 
 ## Note per il test in laboratorio
 
-- `PROTECTED_ZONE` è un placeholder: va tarata guardando la finestra debug
-- La rissa richiede 2+ persone vicine (< `FIGHT_DISTANCE_PX`)
 - L'assembramento richiede `CROWD_COUNT_THRESHOLD` persone per `CROWD_SECONDS_THRESHOLD` secondi
 - `audio_node.py` scarica al primo avvio i pesi PANNs/Whisper (qualche centinaio di MB)

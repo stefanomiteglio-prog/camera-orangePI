@@ -57,8 +57,12 @@ YOLO_WEIGHTS = "yolov8s.pt"
 YOLO_POSE_WEIGHTS = "yolov8s-pose.pt"
 DEVICE = "cpu"   # "cuda" per usare GPU NVIDIA, "cpu" come fallback
 
-# Modalità di esecuzione: False apre la finestra OpenCV con HUD, True opera in background (headless/service)
-HEADLESS = False
+# Modalità di esecuzione e visualizzazione a schermo:
+HEADLESS = False               # False apre la finestra OpenCV con HUD, True opera in background (headless/service)
+WINDOW_NAME = "TreeEyes - Vision Node"  # Titolo della finestra
+WINDOW_FULLSCREEN = True       # True = avvia a schermo intero (fullscreen), False = finestra ridimensionabile
+WINDOW_MONITOR_X = 0           # Offset X (pixel) per selezionare il monitor (es. 0 per monitor principale, 1920 per secondo monitor HDMI)
+WINDOW_MONITOR_Y = 0           # Offset Y (pixel) del monitor desiderato
 
 # Gestione e ritenzione storage locale (pulizia automatica file obsoleti su SD/eMMC)
 MAX_SNAPSHOTS_COUNT = 500
@@ -84,24 +88,12 @@ EVENT_COOLDOWN_SECONDS = 5
 EVENT_COOLDOWN_MAP = {
     "segnale_aiuto": 5,             # Cooldown 5s per gesto aiuto (specifica)
     "arma": 10,
-    "rissa": 10,
     "persona_a_terra": 10,
-    "vandalismo": 10,
     "assembramento": 30,
 }
 
 FALL_ASPECT_RATIO = 1.4
 FALL_TORSO_ANGLE_DEG = 55
-FIGHT_DISTANCE_PX = 150
-# Rapporto di vicinanza prospettica (distanza / diagonale media persone) per rilevare risse anche a distanza
-FIGHT_RELATIVE_DISTANCE_RATIO = 0.85
-FIGHT_MOTION_RATIO_THRESHOLD = 0.35
-MOTION_SMOOTHING_FRAMES = 5
-
-# Zona protetta: supporta sia pixel assoluti (x1, y1, x2, y2) che coordinate relative normalizzate (0.0 a 1.0)
-PROTECTED_ZONE = (200, 150, 450, 400)
-VANDAL_WRIST_RATIO_THRESHOLD = 0.35
-VANDAL_FRAMES_THRESHOLD = 25
 
 CROWD_COUNT_THRESHOLD = 5
 CROWD_SECONDS_THRESHOLD = 60
@@ -132,7 +124,7 @@ VIDEO_CLIP_ENABLED = True
 VIDEO_CLIP_PRE_SECONDS = 5          # Buffer 5s prima dell'evento
 VIDEO_CLIP_POST_SECONDS = 5         # Buffer 5s dopo l'evento (3-5s da specifiche)
 VIDEO_CLIP_DIR = "clips"
-VIDEO_CLIP_TRIGGER_TYPES = {"rissa", "arma", "persona_a_terra", "vandalismo", "fuoco_fumo", "segnale_aiuto"}
+VIDEO_CLIP_TRIGGER_TYPES = {"arma", "persona_a_terra", "fuoco_fumo", "segnale_aiuto", "assembramento"}
 
 VLM_ENABLED = True
 VLM_ENDPOINT = "http://localhost:11434/api/generate"
@@ -142,8 +134,6 @@ VLM_TIMEOUT_SECONDS = 60
 VLM_QUESTIONS = {
     "arma": "Nell'immagine e' visibile un'arma (coltello, bastone, oggetto usato come arma) impugnata o minacciosamente vicino a una persona?",
     "persona_a_terra": "Nell'immagine c'e' una persona sdraiata o accasciata a terra, come se fosse caduta o ferita?",
-    "rissa": "Nell'immagine due o piu' persone si stanno picchiando o aggredendo fisicamente?",
-    "vandalismo": "Nell'immagine una persona sta danneggiando, colpendo o manomettendo un oggetto del parco (panchina, cestino)?",
     "fuoco_fumo": "Nell'immagine e' visibile fuoco o fumo reale?",
     "assembramento": "Nell'immagine c'e' un gruppo insolitamente numeroso di persone assembrate?",
     "segnale_aiuto": "Nell'immagine una persona sta facendo un gesto con la mano che sembra una richiesta di aiuto?",
