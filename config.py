@@ -46,13 +46,24 @@ TELEGRAM_ENABLED = False           # metti True quando hai token e chat_id
 TELEGRAM_BOT_TOKEN = ""
 TELEGRAM_CHAT_ID = ""
 
-# --- Modello YOLO -----------------------------------------------------
-# yolov8n.pt = modello COCO pre-addestrato "nano", leggero e veloce.
-# Sulla tua RTX 5050 puoi tranquillamente salire a yolov8s.pt o yolov8m.pt
-# per maggiore accuratezza mantenendo real-time.
+# --- Modello YOLO / RKNN ----------------------------------------------
+# Percorsi modelli RKNN compilati per NPU Rockchip (RK3588 su Orange Pi 5)
+POSE_RKNN_PATH = "yolov8s-pose.rknn"
+DETECT_RKNN_PATH = "rknn_test/rknn_model_zoo/examples/yolov8/model/yolov8n.rknn"
+RKNN_TARGET = "rk3588"
+
+# Modelli PyTorch (usati nel test locale o fallback PC)
 YOLO_WEIGHTS = "yolov8s.pt"
 YOLO_POSE_WEIGHTS = "yolov8s-pose.pt"
-DEVICE = "cpu"   # "cuda" per usare la RTX 5050, "cpu" come fallback
+DEVICE = "cpu"   # "cuda" per usare GPU NVIDIA, "cpu" come fallback
+
+# Modalità di esecuzione: False apre la finestra OpenCV con HUD, True opera in background (headless/service)
+HEADLESS = False
+
+# Gestione e ritenzione storage locale (pulizia automatica file obsoleti su SD/eMMC)
+MAX_SNAPSHOTS_COUNT = 500
+MAX_CLIPS_COUNT = 100
+STORAGE_CLEANUP_INTERVAL_SECONDS = 1800  # ogni 30 minuti
 
 # Confidence minima per considerare valida una rilevazione
 CONF_THRESHOLD = 0.3
@@ -82,9 +93,12 @@ EVENT_COOLDOWN_MAP = {
 FALL_ASPECT_RATIO = 1.4
 FALL_TORSO_ANGLE_DEG = 55
 FIGHT_DISTANCE_PX = 150
+# Rapporto di vicinanza prospettica (distanza / diagonale media persone) per rilevare risse anche a distanza
+FIGHT_RELATIVE_DISTANCE_RATIO = 0.85
 FIGHT_MOTION_RATIO_THRESHOLD = 0.35
 MOTION_SMOOTHING_FRAMES = 5
 
+# Zona protetta: supporta sia pixel assoluti (x1, y1, x2, y2) che coordinate relative normalizzate (0.0 a 1.0)
 PROTECTED_ZONE = (200, 150, 450, 400)
 VANDAL_WRIST_RATIO_THRESHOLD = 0.35
 VANDAL_FRAMES_THRESHOLD = 25

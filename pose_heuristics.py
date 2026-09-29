@@ -78,18 +78,35 @@ def person_center(box_xyxy):
 
 def is_fighting(people: list) -> bool:
     """people: lista di (center, motion, diag)"""
+    rel_ratio = getattr(config, "FIGHT_RELATIVE_DISTANCE_RATIO", 0.85)
+    motion_thresh = getattr(config, "FIGHT_MOTION_RATIO_THRESHOLD", 0.35)
+    fixed_dist = getattr(config, "FIGHT_DISTANCE_PX", 150)
+
     for i in range(len(people)):
         for j in range(i + 1, len(people)):
             c1, m1, d1 = people[i]
             c2, m2, d2 = people[j]
             dist = math.hypot(c1[0] - c2[0], c1[1] - c2[1])
             ratio1, ratio2 = m1 / d1, m2 / d2
-            if dist <= config.FIGHT_DISTANCE_PX and ratio1 >= config.FIGHT_MOTION_RATIO_THRESHOLD and ratio2 >= config.FIGHT_MOTION_RATIO_THRESHOLD:
+            # Vicinanza adattiva: considera sia la soglia fissa in px che quella prospettica sulla dimensione dei corpi
+            avg_diag = (d1 + d2) / 2.0
+            is_close = (dist <= fixed_dist) or (dist <= avg_diag * rel_ratio)
+            if is_close and ratio1 >= motion_thresh and ratio2 >= motion_thresh:
                 return True
     return False
 
 
-def in_zone(center, zone) -> bool:
-    x, y = center
+def resolve_zone(zone, frame_shape=None) -> tuple:
+    """Risolve le coordinate della zona protetta in pixel interi, scalando se sono normalizzate (0.0 - 1.0)."""
     zx1, zy1, zx2, zy2 = zone
+    if frame_shape and (0.0 <= zx1 <= 1.0 and 0.0 <= zx2 <= 1.0):
+        h, w = frame_shape[:2]
+        return int(zx1 * w), int(zy1 * h), int(zx2 * w), int(zy2 * h)
+    return int(zx1), int(zy1), int(zx2), int(zy2)
+
+
+def in_zone(center, zone, frame_shape=None) -> bool:
+    x, y = center
+    zx1, zy1, zx2, zy2 = resolve_zone(zone, frame_shape)
     return zx1 <= x <= zx2 and zy1 <= y <= zy2
+
