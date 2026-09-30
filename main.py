@@ -10,6 +10,7 @@ import config
 from events import (
     build_mqtt_client,
     publish_event,
+    start_heartbeat,
     notify_telegram,
     verify_handshake,
     upload_snapshot,
@@ -216,12 +217,15 @@ def main():
     executor = ThreadPoolExecutor(max_workers=3)
     frame_idx = 0
     last_detections = []
+    heartbeat_service = None
 
     # 1. Handshake di autenticazione e autorizzazione con il backend centrale HTTP
     verify_handshake()
 
     # 2. Connessione broker MQTT per allarmi in tempo reale
     mqtt_client = build_mqtt_client()
+    # 3. Avvio Heartbeat periodico verso il backend TreeEyes (ogni 60s)
+    heartbeat_service = start_heartbeat(mqtt_client)
     clip = ClipRecorder()
 
     os.makedirs("snapshots", exist_ok=True)
@@ -413,6 +417,8 @@ def main():
             cv2.destroyAllWindows()
         detect_model.release()
         pose_model.release()
+        if heartbeat_service is not None:
+            heartbeat_service.stop()
         if mqtt_client is not None:
             mqtt_client.loop_stop()
             mqtt_client.disconnect()

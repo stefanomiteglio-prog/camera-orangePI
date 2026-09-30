@@ -40,6 +40,10 @@ MQTT_BROKER_HOST = "192.168.88.10"    # Indirizzo del broker Mosquitto
 MQTT_BROKER_PORT = 1883
 # Topic conforme allo standard Parco: parco/<DEVICE_ID>/camera (oppure parco/<DEVICE_ID>/events)
 MQTT_TOPIC = f"parco/{DEVICE_ID}/camera"
+# Topic heartbeat periodico per segnalare stato online: parco/<DEVICE_ID>/heartbeat
+MQTT_HEARTBEAT_TOPIC = f"parco/{DEVICE_ID}/heartbeat"
+# Intervallo invio heartbeat in secondi (specifica TreeEyes: ogni 60 secondi)
+HEARTBEAT_INTERVAL_SECONDS = 60
 
 # --- Telegram (opzionale, riusa il bot che hai gia') ----------------------
 TELEGRAM_ENABLED = False           # metti True quando hai token e chat_id

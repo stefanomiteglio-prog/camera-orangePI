@@ -72,6 +72,22 @@ In `events.py`, la funzione `publish_event` costruisce un JSON con
 backend FastAPI si aspetta nomi di campo diversi per creare la pratica,
 modifica quella funzione — è l'unico punto da toccare.
 
+## Heartbeat periodico (Keep-alive TreeEyes)
+
+Per evitare che la telecamera venga marcata come offline dal backend in assenza di allarmi, un thread dedicato in background (`HeartbeatService` in `events.py`) invia periodicamente un battito cardiaco:
+- **Frequenza:** ogni 60 secondi (immediato all'avvio + periodico)
+- **Topic MQTT:** `parco/<MAC_TELECAMERA>/heartbeat` (QoS 1)
+- **Payload JSON:**
+  ```json
+  {
+    "device_id": "<MAC_TELECAMERA>",
+    "type": "heartbeat"
+  }
+  ```
+Parametri configurabili in `config.py`:
+- `MQTT_HEARTBEAT_TOPIC = f"parco/{DEVICE_ID}/heartbeat"`
+- `HEARTBEAT_INTERVAL_SECONDS = 60`
+
 ## Skeleton completo e segnale di aiuto
 
 - ✅ Skeleton corpo intero (MediaPipe Pose, 33 punti, stile "Palantir")

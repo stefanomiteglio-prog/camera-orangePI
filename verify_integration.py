@@ -147,6 +147,49 @@ def test_mqtt_alert(frame_url):
     print(json.dumps(payload, indent=6))
 
 
+def test_mqtt_heartbeat():
+    print(f"\n{INFO} --- TEST 3.B: Invio Heartbeat Periodico MQTT (Stato Online) ---")
+    received_messages = []
+
+    try:
+        sub_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="verifier_sub_hb", protocol=mqtt.MQTTv5)
+    except (AttributeError, TypeError):
+        sub_client = mqtt.Client(client_id="verifier_sub_hb", protocol=mqtt.MQTTv5)
+
+    def on_message(client, userdata, msg):
+        payload = json.loads(msg.payload.decode())
+        received_messages.append((msg.topic, payload))
+
+    sub_client.on_message = on_message
+    sub_client.connect("localhost", 1883, keepalive=60)
+    sub_client.subscribe(f"parco/{config.DEVICE_ID}/heartbeat", qos=1)
+    sub_client.loop_start()
+    time.sleep(0.4)
+
+    pub_client = events.build_mqtt_client()
+    assert pub_client is not None, "Connessione client MQTT telecamera fallita!"
+
+    ok = events.publish_heartbeat(pub_client)
+    assert ok, "Pubblicazione heartbeat fallita!"
+    time.sleep(0.6)
+
+    sub_client.loop_stop()
+    sub_client.disconnect()
+    pub_client.loop_stop()
+    pub_client.disconnect()
+
+    assert len(received_messages) > 0, "Nessun messaggio heartbeat ricevuto sul topic!"
+    topic, payload = received_messages[0]
+
+    assert topic == f"parco/{config.DEVICE_ID}/heartbeat", f"Topic inatteso: {topic}"
+    assert payload.get("device_id") == config.DEVICE_ID, f"device_id errato: {payload.get('device_id')}"
+    assert payload.get("type") == "heartbeat", f"type errato: {payload.get('type')}"
+
+    print(f" {PASS} 3.B.1 Heartbeat ricevuto su topic: {topic} (QoS 1)")
+    print(f" {PASS} 3.B.2 Payload JSON conforme alle specifiche:")
+    print(json.dumps(payload, indent=6))
+
+
 def test_video_clip_upload():
     print(f"\n{INFO} --- TEST 4: Upload Clip Video MP4 & Correlazione Backend ---")
     dummy_clip_path = "/tmp/test_clip_help.mp4"
@@ -186,6 +229,7 @@ def main():
     test_handshake()
     frame_url = test_snapshot_upload()
     test_mqtt_alert(frame_url)
+    test_mqtt_heartbeat()
     test_video_clip_upload()
 
     print("\n" + "=" * 65)

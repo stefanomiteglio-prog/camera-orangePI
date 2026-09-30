@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import threading
 from datetime import datetime, timezone
 from typing import Optional, Union, Any
 
@@ -306,6 +307,131 @@ def publish_event(
     except Exception as e:
         logger.error(f"Errore pubblicazione evento MQTT: {e}")
         return False
+
+
+# ============================================================
+# HEARTBEAT PERIODICO (BATTITO CARDIACO)
+# ============================================================
+
+def publish_heartbeat(mqtt_client, device_id: Optional[str] = None) -> bool:
+    """
+    Pubblica un battito cardiaco (heartbeat) periodico via MQTT secondo la specifica TreeEyes:
+
+    Topic: parco/<MAC_TELECAMERA>/heartbeat
+    QoS: 1
+    Payload JSON:
+    {
+      "device_id": "<MAC_TELECAMERA>",
+      "type": "heartbeat"
+    }
+    """
+    mac = device_id or config.DEVICE_ID
+    topic = getattr(config, "MQTT_HEARTBEAT_TOPIC", f"parco/{mac}/heartbeat")
+
+    payload = {
+        "device_id": mac,
+        "type": "heartbeat",
+    }
+
+    if mqtt_client is None:
+        logger.debug(f"MQTT offline: heartbeat non inviato al broker per {mac}.")
+        return False
+
+    try:
+        message = json.dumps(payload, ensure_ascii=False)
+        result = mqtt_client.publish(
+            topic,
+            message,
+            qos=1,
+        )
+
+        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+            logger.error(f"Errore pubblicazione heartbeat MQTT su {topic} (rc={result.rc})")
+            return False
+
+        logger.info(f"Heartbeat MQTT inviato: topic={topic}, device_id={mac}")
+        logger.debug(f"Heartbeat payload: {message}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Errore durante l'invio dell'heartbeat MQTT: {e}")
+        return False
+
+
+class HeartbeatService:
+    """
+    Gestore thread in background per l'invio del battito cardiaco (heartbeat) periodico.
+    Evita che la telecamera venga considerata offline dal backend TreeEyes in assenza di allarmi.
+    """
+
+    def __init__(
+        self,
+        mqtt_client,
+        interval: Optional[float] = None,
+        device_id: Optional[str] = None,
+    ):
+        self.mqtt_client = mqtt_client
+        self.interval = float(
+            interval
+            if interval is not None
+            else getattr(config, "HEARTBEAT_INTERVAL_SECONDS", 60)
+        )
+        self.device_id = device_id or config.DEVICE_ID
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        """Avvia il thread in background per l'heartbeat periodico."""
+        if not getattr(config, "MQTT_ENABLED", True) or self.mqtt_client is None:
+            logger.warning("Heartbeat non avviato: MQTT disabilitato o client non connesso.")
+            return self
+
+        if self._thread is not None and self._thread.is_alive():
+            logger.warning("Heartbeat thread già attivo.")
+            return self
+
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="HeartbeatThread",
+            daemon=True,
+        )
+        self._thread.start()
+        logger.info(
+            f"Heartbeat service avviato (intervallo: {self.interval}s, topic: parco/{self.device_id}/heartbeat)."
+        )
+        return self
+
+    def stop(self, timeout: float = 2.0):
+        """Arresta il thread dell'heartbeat in modo tempestivo e sicuro."""
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+            logger.info("Heartbeat service arrestato.")
+
+    def _run(self):
+        # Primo invio immediato per comunicare istantaneamente lo stato online
+        try:
+            publish_heartbeat(self.mqtt_client, self.device_id)
+        except Exception as e:
+            logger.error(f"Errore primo invio heartbeat: {e}")
+
+        # Ciclo periodico: attende l'intervallo o termina subito alla chiamata di stop()
+        while not self._stop_event.wait(self.interval):
+            try:
+                publish_heartbeat(self.mqtt_client, self.device_id)
+            except Exception as e:
+                logger.error(f"Errore ciclo heartbeat: {e}")
+
+
+def start_heartbeat(
+    mqtt_client,
+    interval: Optional[float] = None,
+    device_id: Optional[str] = None,
+) -> HeartbeatService:
+    """Helper per istanziare e avviare il servizio di heartbeat in background."""
+    service = HeartbeatService(mqtt_client, interval=interval, device_id=device_id)
+    return service.start()
 
 
 # ============================================================
