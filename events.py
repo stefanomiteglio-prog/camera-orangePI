@@ -184,25 +184,31 @@ def upload_video_clip(clip_path: str, reason: str = "alert", device_id: Optional
 # MQTT
 # ============================================================
 
-def build_mqtt_client():
+def build_mqtt_client(client_id: Optional[str] = None):
     """
     Crea e connette il client MQTT della Vision Node.
 
-    Il device_id corrisponde al MAC address della telecamera.
+    Una sola connessione è condivisa da tutte le telecamere: ciascuna pubblica
+    poi sul proprio topic (parco/<device_id>/camera). Per questo il client_id
+    NON è più il device_id di una singola telecamera, ma un identificativo unico
+    del nodo (config.MQTT_CLIENT_ID), evitando che due connessioni con lo stesso
+    client_id si sconnettano a vicenda.
     """
     if not getattr(config, "MQTT_ENABLED", True):
         logger.warning("MQTT disabilitato in config.py (modalità offline).")
         return None
 
+    cid = client_id or getattr(config, "MQTT_CLIENT_ID", "treeeyes-vision-node")
+
     try:
         client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
-            client_id=config.DEVICE_ID,
+            client_id=cid,
             protocol=mqtt.MQTTv5,
         )
     except (AttributeError, TypeError):
         client = mqtt.Client(
-            client_id=config.DEVICE_ID,
+            client_id=cid,
             protocol=mqtt.MQTTv5,
         )
 
@@ -224,10 +230,8 @@ def build_mqtt_client():
         client.loop_start()
 
         logger.info(
-            f"MQTT connesso a {config.MQTT_BROKER_HOST}:{config.MQTT_BROKER_PORT}"
+            f"MQTT connesso a {config.MQTT_BROKER_HOST}:{config.MQTT_BROKER_PORT} (client_id={cid})"
         )
-        logger.info(f"Vision Node MAC: {config.DEVICE_ID}")
-        logger.info(f"MQTT Topic allarmi: {config.MQTT_TOPIC}")
         return client
 
     except Exception as e:
@@ -248,15 +252,19 @@ def publish_event(
     confidence: float,
     frame_url: Optional[str] = None,
     description: Optional[str] = None,
+    device_id: Optional[str] = None,
 ):
     """
-    Pubblica un allarme istantaneo via MQTT secondo la specifica:
+    Pubblica un allarme istantaneo via MQTT secondo la specifica.
 
-    Topic: parco/<DEVICE_ID>/camera
+    Il device_id è quello della telecamera che ha generato l'evento (Zona A o
+    Zona B): determina sia il campo 'device_id' del payload sia il topic.
+
+    Topic: parco/<device_id>/camera
     QoS: 1
     Payload JSON:
     {
-      "device_id": "c0:74:2b:fb:00:3f",
+      "device_id": "treeeyes_zona_a",
       "type": "alert",
       "val_number": 1,
       "alert_type": "segnale_aiuto",
@@ -265,10 +273,12 @@ def publish_event(
       "sampling_time": "2026-09-25T15:30:00Z"
     }
     """
+    dev = device_id or config.DEVICE_ID
+    topic = f"parco/{dev}/camera"
     sampling_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     payload = {
-        "device_id": config.DEVICE_ID,
+        "device_id": dev,
         "type": "alert",
         "val_number": 1,
         "alert_type": danger_type,
@@ -283,23 +293,23 @@ def publish_event(
         payload["description"] = description
 
     if mqtt_client is None:
-        logger.debug(f"MQTT offline: allarme {danger_type} non inviato al broker.")
+        logger.debug(f"MQTT offline: allarme {danger_type} ({dev}) non inviato al broker.")
         return False
 
     try:
         message = json.dumps(payload, ensure_ascii=False)
         result = mqtt_client.publish(
-            config.MQTT_TOPIC,
+            topic,
             message,
             qos=1,
         )
 
         if result.rc != mqtt.MQTT_ERR_SUCCESS:
-            logger.error(f"Errore pubblicazione MQTT (rc={result.rc})")
+            logger.error(f"Errore pubblicazione MQTT su {topic} (rc={result.rc})")
             return False
 
         logger.info(
-            f"Allarme MQTT inviato: {danger_type} (conf={float(confidence):.2f}, frame_url={frame_url})"
+            f"Allarme MQTT inviato [{dev}]: {danger_type} (conf={float(confidence):.2f}, frame_url={frame_url})"
         )
         logger.debug(f"MQTT payload: {message}")
         return True
@@ -326,7 +336,9 @@ def publish_heartbeat(mqtt_client, device_id: Optional[str] = None) -> bool:
     }
     """
     mac = device_id or config.DEVICE_ID
-    topic = getattr(config, "MQTT_HEARTBEAT_TOPIC", f"parco/{mac}/heartbeat")
+    # Topic sempre derivato dal device_id della telecamera (una per zona),
+    # così ogni telecamera ha il proprio heartbeat indipendente.
+    topic = f"parco/{mac}/heartbeat"
 
     payload = {
         "device_id": mac,

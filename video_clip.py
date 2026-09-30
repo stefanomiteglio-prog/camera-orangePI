@@ -11,7 +11,10 @@ from logger import logger
 
 
 class ClipRecorder:
-    def __init__(self):
+    def __init__(self, device_id=None):
+        # device_id della telecamera proprietaria: la clip viene caricata sul
+        # backend a nome di quella telecamera (Zona A / Zona B).
+        self.device_id = device_id
         self.buffer = deque()
         self.recording_frames = None
         self.recording_until = None
@@ -67,6 +70,6 @@ class ClipRecorder:
 
         try:
             from events import upload_video_clip
-            upload_video_clip(path, reason=reason)
+            upload_video_clip(path, reason=reason, device_id=self.device_id)
         except Exception as e:
             logger.error(f"Errore upload clip video: {e}")

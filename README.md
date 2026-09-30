@@ -17,8 +17,34 @@ La prima esecuzione scarica automaticamente i pesi `yolov8n.pt` (~6MB).
 
 Modifica `config.py`:
 - `MQTT_BROKER_HOST` / `MQTT_BROKER_PORT` → il tuo broker Mosquitto
+- `CAMERAS` → lista delle telecamere (vedi sotto "Due telecamere")
 - `DEVICE` → lascia `"cuda"` per usare la RTX 5050 (molto più veloce), `"cpu"` come fallback
 - `TELEGRAM_ENABLED = True` + token/chat_id se vuoi le notifiche subito attive
+
+## Due telecamere (Zona A / Zona B)
+
+Il nodo gira con **due telecamere in contemporanea**, definite nella lista
+`CAMERAS` in `config.py`. Ogni telecamera invia al backend con il **proprio
+`device_id`** (stringa libera, non più un MAC unico), da registrare nella lista
+dispositivi del server:
+
+```python
+CAMERAS = [
+    {"device_id": "treeeyes_zona_a", "zone": "Zona A",
+     "camera_index": "/dev/v4l/by-id/usb-..._USB_2.0_Camera-video-index0", ...},
+    {"device_id": "treeeyes_zona_b", "zone": "Zona B",
+     "camera_index": "/dev/v4l/by-id/usb-..._USB_2.0_Camera_SN5100-video-index0", ...},
+]
+```
+
+- `camera_index` usa il path **V4L2 by-id**: l'associazione zona→telecamera
+  resta stabile anche se cambia l'ordine di enumerazione USB.
+- Ogni telecamera pubblica su topic distinti: `parco/<device_id>/camera` e
+  `parco/<device_id>/heartbeat`, con snapshot/clip a nome del proprio `device_id`.
+- I modelli NPU (detect + pose) sono **condivisi** tra le due pipeline e
+  serializzati con lock, per non saturare i core NPU del RK3588.
+- La finestra mostra le **due telecamere affiancate**, ciascuna con HUD, etichetta
+  di zona e indicatore FPS.
 
 Poi:
 ```bash
@@ -84,8 +110,10 @@ Per evitare che la telecamera venga marcata come offline dal backend in assenza 
     "type": "heartbeat"
   }
   ```
+Con due telecamere viene avviato **un heartbeat per ciascun `device_id`**, sui
+rispettivi topic `parco/<device_id>/heartbeat`.
+
 Parametri configurabili in `config.py`:
-- `MQTT_HEARTBEAT_TOPIC = f"parco/{DEVICE_ID}/heartbeat"`
 - `HEARTBEAT_INTERVAL_SECONDS = 60`
 
 ## Skeleton completo e segnale di aiuto

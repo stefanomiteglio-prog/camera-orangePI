@@ -4,6 +4,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
+import numpy as np
 from rknnlite.api import RKNNLite
 
 import config
@@ -16,7 +17,7 @@ from events import (
     upload_snapshot,
 )
 import pose_heuristics as ph
-import hand_gesture as hg
+from hand_gesture import HelpGestureDetector
 import hud
 import vlm_confirm
 from video_clip import ClipRecorder
@@ -54,81 +55,65 @@ def cleanup_old_files(directory: str, max_files: int):
         logger.warning(f"Errore durante pulizia storage in {directory}: {e}")
 
 
-def _process_event_async(danger_type, confidence, snapshot_path, raw_frame, mqtt_client):
+def _process_event_async(device_id, zone, danger_type, confidence, snapshot_path, raw_frame, mqtt_client):
     """
     Gestisce l'upload dello snapshot HTTP e l'invio dell'allarme MQTT in background,
+    a nome della telecamera (device_id/zona) che ha generato l'evento,
     utilizzando il frame raw pulito (senza bounding box o artefatti HUD).
     """
     # 1. Carica snapshot JPG al backend per ottenere l'URL pubblico (frame_url)
-    frame_url = upload_snapshot(raw_frame if raw_frame is not None else snapshot_path)
+    frame_url = upload_snapshot(raw_frame if raw_frame is not None else snapshot_path, device_id=device_id)
 
     description = ""
     # 2. VLM confirmation se abilitato (saltato per 'segnale_aiuto' per garantire reattività immediata)
     if config.VLM_ENABLED and danger_type != "segnale_aiuto":
         confirmed, description = vlm_confirm.confirm(snapshot_path, danger_type)
         if not confirmed:
-            logger.info(f"Evento {danger_type} scartato dal VLM (falso positivo): {description}")
+            logger.info(f"[{device_id}] Evento {danger_type} scartato dal VLM (falso positivo): {description}")
             return
 
-    # 3. Pubblica allarme istantaneo via MQTT sul topic parco/<MAC>/camera con frame_url
+    # 3. Pubblica allarme istantaneo via MQTT sul topic parco/<device_id>/camera con frame_url
     publish_event(
         mqtt_client=mqtt_client,
         danger_type=danger_type,
         confidence=confidence,
         frame_url=frame_url,
         description=description,
+        device_id=device_id,
     )
 
     # 4. Notifica Telegram opzionale
     label = f"{danger_type} - {description}" if description else danger_type
-    notify_telegram(f"⚠️ TreeEyes - {label} (Camera: {config.DEVICE_ID})")
+    notify_telegram(f"⚠️ TreeEyes [{zone}] - {label} (Camera: {device_id})")
 
 
-def fire_event(now, danger_type, confidence, raw_frame, mqtt_client, last_event_time, clip):
-    """
-    Innesca un evento di pericolo, salvando il frame raw non alterato su disco
-    e avviando clip e upload in modo thread-safe.
-    """
-    cooldown = getattr(config, "EVENT_COOLDOWN_MAP", {}).get(danger_type, config.EVENT_COOLDOWN_SECONDS)
-    if now - last_event_time.get(danger_type, 0) < cooldown:
-        return False
-
-    last_event_time[danger_type] = now
-    os.makedirs("snapshots", exist_ok=True)
-    snapshot_path = f"snapshots/{danger_type}_{int(now)}.jpg"
-    frame_copy = raw_frame.copy()
-    cv2.imwrite(snapshot_path, frame_copy)
-
-    # Avvia buffer di registrazione video (3-5s post-evento) con frame pulito
-    clip.trigger(danger_type)
-
-    threading.Thread(
-        target=_process_event_async,
-        args=(danger_type, confidence, snapshot_path, frame_copy, mqtt_client),
-        daemon=True,
-    ).start()
-    return True
-
-
-def open_capture():
-    cap = cv2.VideoCapture(config.CAMERA_INDEX)
+def open_capture(cam_cfg):
+    source = cam_cfg["camera_index"]
+    cap = cv2.VideoCapture(source)
     if not cap.isOpened():
-        raise RuntimeError(f"Impossibile aprire la sorgente video: {config.CAMERA_INDEX}")
+        raise RuntimeError(f"Impossibile aprire la sorgente video: {source}")
 
     # Imposta formato MJPG se disponibile (riduce il carico del bus USB)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
 
-    if getattr(config, "CAMERA_WIDTH", None):
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAMERA_WIDTH)
-    if getattr(config, "CAMERA_HEIGHT", None):
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
-    if getattr(config, "CAMERA_FPS", None):
-        cap.set(cv2.CAP_PROP_FPS, config.CAMERA_FPS)
+    width = cam_cfg.get("width", getattr(config, "CAMERA_WIDTH", None))
+    height = cam_cfg.get("height", getattr(config, "CAMERA_HEIGHT", None))
+    fps = cam_cfg.get("fps", getattr(config, "CAMERA_FPS", None))
+
+    if width:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    if height:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    if fps:
+        cap.set(cv2.CAP_PROP_FPS, fps)
 
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     actual_fps = cap.get(cv2.CAP_PROP_FPS)
-    logger.info(f"Telecamera configurata: {actual_w}x{actual_h} @ {actual_fps:.1f} FPS")
+    logger.info(
+        f"[{cam_cfg.get('zone', '?')}] Telecamera '{cam_cfg['device_id']}' configurata: "
+        f"{actual_w}x{actual_h} @ {actual_fps:.1f} FPS ({source})"
+    )
 
     return cap
 
@@ -137,9 +122,11 @@ class VideoCaptureThread:
     """
     Thread di acquisizione video non-bloccante a latenza zero.
     Svuota costantemente il buffer hardware del driver V4L2 mantenendo
-    disponibile esclusivamente il frame più recente per il loop principale.
+    disponibile esclusivamente il frame più recente per la pipeline.
+    Un'istanza per telecamera.
     """
-    def __init__(self):
+    def __init__(self, cam_cfg):
+        self.cam_cfg = cam_cfg
         self.cap = None
         self.running = False
         self.frame = None
@@ -151,10 +138,10 @@ class VideoCaptureThread:
 
     def _init_cap(self):
         try:
-            self.cap = open_capture()
+            self.cap = open_capture(self.cam_cfg)
             self.consecutive_failures = 0
         except Exception as e:
-            logger.error(f"Inizializzazione capture fallita: {e}")
+            logger.error(f"[{self.cam_cfg.get('zone', '?')}] Inizializzazione capture fallita: {e}")
             self.cap = None
 
     def start(self):
@@ -174,7 +161,7 @@ class VideoCaptureThread:
             if not ok:
                 self.consecutive_failures += 1
                 if self.consecutive_failures >= 10:
-                    logger.warning("Riconnessione webcam nel thread di acquisizione...")
+                    logger.warning(f"[{self.cam_cfg.get('zone', '?')}] Riconnessione webcam...")
                     try:
                         self.cap.release()
                     except Exception:
@@ -209,77 +196,111 @@ class VideoCaptureThread:
                 pass
 
 
-def main():
-    logger.info("Caricamento modelli RKNN...")
-    detect_model = DetectModel(DETECT_RKNN_PATH, core_mask=RKNNLite.NPU_CORE_0, conf_thresh=config.CONF_THRESHOLD)
-    pose_model = PoseModel(POSE_RKNN_PATH, core_mask=RKNNLite.NPU_CORE_1, conf_thresh=config.CONF_THRESHOLD)
-    tracker = SimpleTracker()
-    executor = ThreadPoolExecutor(max_workers=3)
-    frame_idx = 0
-    last_detections = []
-    heartbeat_service = None
+class CameraPipeline(threading.Thread):
+    """
+    Pipeline completa per UNA telecamera, in un thread dedicato.
 
-    # 1. Handshake di autenticazione e autorizzazione con il backend centrale HTTP
-    verify_handshake()
+    Ogni pipeline ha stato indipendente (contatori, cooldown, tracker, clip,
+    rilevatore gesto) e pubblica gli allarmi con il proprio device_id.
+    I modelli NPU (detect/pose) sono CONDIVISI tra le pipeline e protetti da lock
+    per serializzare l'accesso all'acceleratore RK3588.
 
-    # 2. Connessione broker MQTT per allarmi in tempo reale
-    mqtt_client = build_mqtt_client()
-    # 3. Avvio Heartbeat periodico verso il backend TreeEyes (ogni 60s)
-    heartbeat_service = start_heartbeat(mqtt_client)
-    clip = ClipRecorder()
+    La pipeline non chiama mai OpenCV imshow: si limita a produrre l'ultimo frame
+    di rendering (con HUD ed etichette), che il thread principale compone e mostra.
+    """
 
-    os.makedirs("snapshots", exist_ok=True)
-    os.makedirs(getattr(config, "VIDEO_CLIP_DIR", "clips"), exist_ok=True)
+    def __init__(self, cam_cfg, detect_model, pose_model, detect_lock, pose_lock, mqtt_client):
+        super().__init__(daemon=True)
+        self.cam_cfg = cam_cfg
+        self.device_id = cam_cfg["device_id"]
+        self.zone = cam_cfg.get("zone", self.device_id)
 
-    # Pulizia iniziale storage
-    cleanup_old_files("snapshots", getattr(config, "MAX_SNAPSHOTS_COUNT", 500))
-    cleanup_old_files(getattr(config, "VIDEO_CLIP_DIR", "clips"), getattr(config, "MAX_CLIPS_COUNT", 100))
-    last_cleanup_time = time.time()
+        self.detect_model = detect_model
+        self.pose_model = pose_model
+        self.detect_lock = detect_lock
+        self.pose_lock = pose_lock
+        self.mqtt_client = mqtt_client
 
-    consecutive_counts = {}
-    last_event_time = {}
-    crowd_start_time = None
+        self.capture = None
+        self.gesture = HelpGestureDetector()
+        self.clip = ClipRecorder(device_id=self.device_id)
+        self.tracker = SimpleTracker()
+        self.executor = ThreadPoolExecutor(max_workers=3)
 
-    # Avvio thread video dedicato a latenza zero
-    video_stream = VideoCaptureThread().start()
+        self.consecutive_counts = {}
+        self.last_event_time = {}
+        self.crowd_start_time = None
+        self.frame_idx = 0
+        self.last_detections = []
 
-    window_name = getattr(config, "WINDOW_NAME", "TreeEyes - Vision Node")
-    is_fullscreen = getattr(config, "WINDOW_FULLSCREEN", True)
-    monitor_x = getattr(config, "WINDOW_MONITOR_X", 0)
-    monitor_y = getattr(config, "WINDOW_MONITOR_Y", 0)
+        self._fps = 0.0
+        self._last_fps_t = time.time()
 
-    # Inizializzazione finestra OpenCV: supporta fullscreen e spostamento sul monitor desiderato
-    if not getattr(config, "HEADLESS", False):
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        if monitor_x != 0 or monitor_y != 0:
-            cv2.moveWindow(window_name, monitor_x, monitor_y)
-        if is_fullscreen:
-            cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        self.latest_display = None
+        self.display_lock = threading.Lock()
+        self.running = False
 
-    logger.info(
-        f"Avvio completato. HEADLESS={getattr(config, 'HEADLESS', False)}, "
-        f"FULLSCREEN={is_fullscreen} (Monitor X={monitor_x}, Y={monitor_y}). "
-        f"Controlli: 'q'/ESC esci, 'f' toggle fullscreen, 'r' reset allarmi."
-    )
+    # ----- accesso NPU serializzato -----
+    def _infer_pose(self, frame):
+        with self.pose_lock:
+            return self.pose_model.infer(frame)
 
-    try:
-        while True:
-            ok, raw_frame = video_stream.read(timeout=1.5)
+    def _infer_detect(self, frame):
+        with self.detect_lock:
+            return self.detect_model.infer(frame)
+
+    def reset(self):
+        self.last_event_time.clear()
+        self.consecutive_counts.clear()
+        self.crowd_start_time = None
+        logger.info(f"[{self.zone}] Reset manuale cooldown/contatori.")
+
+    def _fire_event(self, now, danger_type, confidence, raw_frame):
+        cooldown = getattr(config, "EVENT_COOLDOWN_MAP", {}).get(danger_type, config.EVENT_COOLDOWN_SECONDS)
+        if now - self.last_event_time.get(danger_type, 0) < cooldown:
+            return False
+
+        self.last_event_time[danger_type] = now
+        os.makedirs("snapshots", exist_ok=True)
+        snapshot_path = f"snapshots/{self.device_id}_{danger_type}_{int(now)}.jpg"
+        frame_copy = raw_frame.copy()
+        cv2.imwrite(snapshot_path, frame_copy)
+
+        # Avvia buffer di registrazione video (post-evento) con frame pulito
+        self.clip.trigger(danger_type)
+
+        threading.Thread(
+            target=_process_event_async,
+            args=(self.device_id, self.zone, danger_type, confidence, snapshot_path, frame_copy, self.mqtt_client),
+            daemon=True,
+        ).start()
+        logger.info(f"[{self.zone}] Evento innescato: {danger_type} (conf={confidence:.2f})")
+        return True
+
+    def get_display(self):
+        with self.display_lock:
+            if self.latest_display is None:
+                return None
+            return self.latest_display.copy()
+
+    def stop(self):
+        self.running = False
+
+    def run(self):
+        self.running = True
+        self.capture = VideoCaptureThread(self.cam_cfg).start()
+
+        while self.running:
+            ok, raw_frame = self.capture.read(timeout=1.5)
             if not ok:
-                logger.warning("Frame video non disponibile o timeout cattura.")
+                logger.warning(f"[{self.zone}] Frame non disponibile o timeout cattura.")
                 continue
 
             now = time.time()
-            frame_idx += 1
-
-            # Pulizia periodica storage ogni STORAGE_CLEANUP_INTERVAL_SECONDS
-            if now - last_cleanup_time > getattr(config, "STORAGE_CLEANUP_INTERVAL_SECONDS", 1800):
-                cleanup_old_files("snapshots", getattr(config, "MAX_SNAPSHOTS_COUNT", 500))
-                cleanup_old_files(getattr(config, "VIDEO_CLIP_DIR", "clips"), getattr(config, "MAX_CLIPS_COUNT", 100))
-                last_cleanup_time = now
+            self.frame_idx += 1
 
             # 1. Aggiorna buffer circolare clip video con il frame raw pulito
-            clip.update(raw_frame)
+            self.clip.update(raw_frame)
 
             detected_this_frame = set()
             person_count = 0
@@ -287,17 +308,17 @@ def main():
             # 2. Inferenze in parallelo su thread dedicati usando il frame raw
             small_raw = cv2.resize(raw_frame, (raw_frame.shape[1] // 2, raw_frame.shape[0] // 2))
 
-            pose_future = executor.submit(pose_model.infer, raw_frame)
-            hands_future = executor.submit(hg.detect_help_gesture, small_raw)
-            if frame_idx % 2 == 0:
-                detect_future = executor.submit(detect_model.infer, raw_frame)
-                last_detections = detect_future.result()
-            detections = last_detections
+            pose_future = self.executor.submit(self._infer_pose, raw_frame)
+            hands_future = self.executor.submit(self.gesture.detect, small_raw)
+            if self.frame_idx % 2 == 0:
+                detect_future = self.executor.submit(self._infer_detect, raw_frame)
+                self.last_detections = detect_future.result()
+            detections = self.last_detections
 
             pose_results = pose_future.result()
             gesture_triggered = hands_future.result()
 
-            # 3. Creazione frame di rendering dedicato all'HUD e visualizzazione
+            # 3. Frame di rendering dedicato all'HUD
             display_frame = raw_frame.copy()
 
             # --- Analisi Oggetti Pericolosi ---
@@ -313,12 +334,12 @@ def main():
                     cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
                     cv2.putText(display_frame, f"{class_name} {confidence:.2f}", (x1, y1 - 8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                    consecutive_counts[danger_type] = consecutive_counts.get(danger_type, 0) + 1
-                    if consecutive_counts[danger_type] >= config.CONSECUTIVE_FRAMES_THRESHOLD:
-                        fire_event(now, danger_type, confidence, raw_frame, mqtt_client, last_event_time, clip)
+                    self.consecutive_counts[danger_type] = self.consecutive_counts.get(danger_type, 0) + 1
+                    if self.consecutive_counts[danger_type] >= config.CONSECUTIVE_FRAMES_THRESHOLD:
+                        self._fire_event(now, danger_type, confidence, raw_frame)
 
             # --- Analisi Pose e Caduta ---
-            tracked = tracker.update(pose_results)
+            tracked = self.tracker.update(pose_results)
 
             for det in tracked:
                 track_id = det["track_id"]
@@ -342,44 +363,176 @@ def main():
 
                 if ph.is_fallen(xyxy, keypoints, kconf):
                     detected_this_frame.add("persona_a_terra")
-                    consecutive_counts["persona_a_terra"] = consecutive_counts.get("persona_a_terra", 0) + 1
+                    self.consecutive_counts["persona_a_terra"] = self.consecutive_counts.get("persona_a_terra", 0) + 1
 
             # Innesco allarme caduta validato
-            if "persona_a_terra" in detected_this_frame and consecutive_counts.get("persona_a_terra", 0) >= config.CONSECUTIVE_FRAMES_THRESHOLD:
-                fire_event(now, "persona_a_terra", 1.0, raw_frame, mqtt_client, last_event_time, clip)
+            if "persona_a_terra" in detected_this_frame and self.consecutive_counts.get("persona_a_terra", 0) >= config.CONSECUTIVE_FRAMES_THRESHOLD:
+                self._fire_event(now, "persona_a_terra", 1.0, raw_frame)
 
             # Reset contatori per pericoli non più visibili nel frame corrente
-            for danger_type in list(consecutive_counts.keys()):
+            for danger_type in list(self.consecutive_counts.keys()):
                 if danger_type not in detected_this_frame:
-                    consecutive_counts[danger_type] = 0
+                    self.consecutive_counts[danger_type] = 0
 
             # --- Assembramento ---
             if person_count >= config.CROWD_COUNT_THRESHOLD:
-                if crowd_start_time is None:
-                    crowd_start_time = now
-                elif now - crowd_start_time >= config.CROWD_SECONDS_THRESHOLD:
-                    fire_event(now, "assembramento", 1.0, raw_frame, mqtt_client, last_event_time, clip)
+                if self.crowd_start_time is None:
+                    self.crowd_start_time = now
+                elif now - self.crowd_start_time >= config.CROWD_SECONDS_THRESHOLD:
+                    self._fire_event(now, "assembramento", 1.0, raw_frame)
             else:
-                crowd_start_time = None
+                self.crowd_start_time = None
 
             # --- Skeleton + gesto aiuto ---
             if gesture_triggered:
-                fire_event(now, "segnale_aiuto", 1.0, raw_frame, mqtt_client, last_event_time, clip)
+                self._fire_event(now, "segnale_aiuto", 1.0, raw_frame)
 
-            # --- HUD e visualizzatore ---
-            hud.draw_progress_bar(display_frame, "Gesto aiuto", hg.gesture_progress())
+            # --- HUD ---
+            # FPS smussato
+            dt = now - self._last_fps_t
+            if dt > 0:
+                inst = 1.0 / dt
+                self._fps = inst if self._fps == 0 else (self._fps * 0.9 + inst * 0.1)
+            self._last_fps_t = now
+
+            hud.draw_progress_bar(display_frame, "Gesto aiuto", self.gesture.progress())
             hud.draw_panel(display_frame, [
                 ("Persone", False, f"({person_count})"),
                 ("Caduta", "persona_a_terra" in detected_this_frame, ""),
-                ("Assembramento", crowd_start_time is not None, ""),
+                ("Assembramento", self.crowd_start_time is not None, ""),
                 ("Gesto aiuto", gesture_triggered, ""),
-            ], recording=clip.is_recording())
+            ], recording=self.clip.is_recording())
+
+            # Etichetta zona (in alto a destra della sotto-immagine) + FPS
+            fh, fw = display_frame.shape[:2]
+            cv2.putText(display_frame, f"{self.zone}", (fw - 200, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(display_frame, f"{self._fps:.0f} FPS", (fw - 120, fh - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
+
+            with self.display_lock:
+                self.latest_display = display_frame
+
+            if getattr(config, "HEADLESS", False) and self.frame_idx % 150 == 0:
+                logger.info(
+                    f"[{self.zone}] Status: frame={self.frame_idx}, persone={person_count}, "
+                    f"allarmi_attivi={list(detected_this_frame)}, clip_rec={self.clip.is_recording()}, fps={self._fps:.1f}"
+                )
+
+        # cleanup pipeline
+        if self.capture is not None:
+            self.capture.release()
+        self.executor.shutdown(wait=False)
+        self.gesture.close()
+
+
+def _placeholder(zone, width=1280, height=720):
+    """Riquadro nero con etichetta quando una telecamera non ha ancora un frame."""
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    cv2.putText(img, f"{zone}", (40, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(img, "IN ATTESA SEGNALE...", (40, height // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2, cv2.LINE_AA)
+    return img
+
+
+def compose_grid(pipelines, target_h=720):
+    """
+    Compone i display delle telecamere affiancati orizzontalmente,
+    normalizzando all'altezza target e separandoli con una sottile linea.
+    """
+    tiles = []
+    for p in pipelines:
+        frame = p.get_display()
+        if frame is None:
+            frame = _placeholder(p.zone)
+        h, w = frame.shape[:2]
+        if h != target_h:
+            scale = target_h / h
+            frame = cv2.resize(frame, (int(w * scale), target_h))
+        tiles.append(frame)
+
+    # separatore verticale
+    sep = np.full((target_h, 4, 3), 60, dtype=np.uint8)
+    composed = []
+    for i, t in enumerate(tiles):
+        if i > 0:
+            composed.append(sep)
+        composed.append(t)
+    return cv2.hconcat(composed) if composed else _placeholder("TreeEyes")
+
+
+def main():
+    logger.info("Caricamento modelli RKNN (condivisi tra le telecamere)...")
+    detect_model = DetectModel(DETECT_RKNN_PATH, core_mask=RKNNLite.NPU_CORE_0, conf_thresh=config.CONF_THRESHOLD)
+    pose_model = PoseModel(POSE_RKNN_PATH, core_mask=RKNNLite.NPU_CORE_1, conf_thresh=config.CONF_THRESHOLD)
+    detect_lock = threading.Lock()
+    pose_lock = threading.Lock()
+
+    cameras = getattr(config, "CAMERAS", None)
+    if not cameras:
+        raise RuntimeError("Nessuna telecamera definita in config.CAMERAS")
+
+    # 1. Handshake di autenticazione per OGNI telecamera
+    for cam in cameras:
+        verify_handshake(cam["device_id"])
+
+    # 2. Connessione broker MQTT (una connessione condivisa)
+    mqtt_client = build_mqtt_client()
+
+    # 3. Avvio Heartbeat periodico per OGNI telecamera (ognuna sul proprio topic)
+    heartbeat_services = [start_heartbeat(mqtt_client, device_id=cam["device_id"]) for cam in cameras]
+
+    os.makedirs("snapshots", exist_ok=True)
+    os.makedirs(getattr(config, "VIDEO_CLIP_DIR", "clips"), exist_ok=True)
+
+    # Pulizia iniziale storage
+    cleanup_old_files("snapshots", getattr(config, "MAX_SNAPSHOTS_COUNT", 500))
+    cleanup_old_files(getattr(config, "VIDEO_CLIP_DIR", "clips"), getattr(config, "MAX_CLIPS_COUNT", 100))
+    last_cleanup_time = time.time()
+
+    # 4. Avvio pipeline (una per telecamera)
+    pipelines = [
+        CameraPipeline(cam, detect_model, pose_model, detect_lock, pose_lock, mqtt_client)
+        for cam in cameras
+    ]
+    for p in pipelines:
+        p.start()
+
+    window_name = getattr(config, "WINDOW_NAME", "TreeEyes - Vision Node")
+    is_fullscreen = getattr(config, "WINDOW_FULLSCREEN", True)
+    monitor_x = getattr(config, "WINDOW_MONITOR_X", 0)
+    monitor_y = getattr(config, "WINDOW_MONITOR_Y", 0)
+
+    if not getattr(config, "HEADLESS", False):
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        if monitor_x != 0 or monitor_y != 0:
+            cv2.moveWindow(window_name, monitor_x, monitor_y)
+        if is_fullscreen:
+            cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+    logger.info(
+        f"Avvio completato con {len(pipelines)} telecamere "
+        f"({', '.join(c['zone'] for c in cameras)}). "
+        f"HEADLESS={getattr(config, 'HEADLESS', False)}, FULLSCREEN={is_fullscreen}. "
+        f"Controlli: 'q'/ESC esci, 'f' toggle fullscreen, 'r' reset allarmi."
+    )
+
+    first_shown = False
+    try:
+        while True:
+            # Pulizia periodica storage
+            now = time.time()
+            if now - last_cleanup_time > getattr(config, "STORAGE_CLEANUP_INTERVAL_SECONDS", 1800):
+                cleanup_old_files("snapshots", getattr(config, "MAX_SNAPSHOTS_COUNT", 500))
+                cleanup_old_files(getattr(config, "VIDEO_CLIP_DIR", "clips"), getattr(config, "MAX_CLIPS_COUNT", 100))
+                last_cleanup_time = now
 
             if not getattr(config, "HEADLESS", False):
-                cv2.imshow(window_name, display_frame)
+                grid = compose_grid(pipelines)
+                cv2.imshow(window_name, grid)
 
-                # Al primo frame renderizzato, riapplica posizione e fullscreen per garantire compatibilità X11 / Wayland
-                if frame_idx == 1:
+                if not first_shown:
+                    first_shown = True
                     if monitor_x != 0 or monitor_y != 0:
                         cv2.moveWindow(window_name, monitor_x, monitor_y)
                     if is_fullscreen:
@@ -389,10 +542,8 @@ def main():
                 if key == ord("q") or key == 27:
                     break
                 if key == ord("r"):
-                    last_event_time.clear()
-                    consecutive_counts.clear()
-                    crowd_start_time = None
-                    logger.info("Reset manuale cooldown/contatori (demo).")
+                    for p in pipelines:
+                        p.reset()
                 if key in (ord("f"), ord("F")):
                     is_fullscreen = not is_fullscreen
                     prop = cv2.WINDOW_FULLSCREEN if is_fullscreen else cv2.WINDOW_NORMAL
@@ -400,25 +551,23 @@ def main():
                     if not is_fullscreen:
                         if monitor_x != 0 or monitor_y != 0:
                             cv2.moveWindow(window_name, monitor_x, monitor_y)
-                        cv2.resizeWindow(window_name, 1280, 720)
+                        cv2.resizeWindow(window_name, 1600, 600)
                     logger.info(f"Fullscreen: {'ATTIVATO' if is_fullscreen else 'DISATTIVATO'}")
             else:
-                # In modalità headless senza display, mantieni una breve pausa per cedere la CPU
-                time.sleep(0.001)
-                if frame_idx % 150 == 0:
-                    logger.info(
-                        f"Status: frame={frame_idx}, persone={person_count}, "
-                        f"allarmi_attivi={list(detected_this_frame)}, clip_rec={clip.is_recording()}"
-                    )
+                time.sleep(0.05)
 
     finally:
-        video_stream.release()
+        for p in pipelines:
+            p.stop()
+        for p in pipelines:
+            p.join(timeout=2.0)
         if not getattr(config, "HEADLESS", False):
             cv2.destroyAllWindows()
         detect_model.release()
         pose_model.release()
-        if heartbeat_service is not None:
-            heartbeat_service.stop()
+        for hb in heartbeat_services:
+            if hb is not None:
+                hb.stop()
         if mqtt_client is not None:
             mqtt_client.loop_stop()
             mqtt_client.disconnect()

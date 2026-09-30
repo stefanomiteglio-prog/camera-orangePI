@@ -10,10 +10,6 @@ mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
 mp_styles = mp.solutions.drawing_styles
 
-hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.5, min_tracking_confidence=0.5)
-
-_gesture_state = {"open_since": None, "open_seen_at": None, "tucked_since": None}
-
 
 def _hand_diag(landmarks) -> float:
     xs = [p.x for p in landmarks]
@@ -50,54 +46,99 @@ def _is_thumb_tucked_fist(landmarks, diag) -> bool:
     return folded >= 3 and thumb_dist_ratio < config.HELP_GESTURE_TUCK_RATIO
 
 
-def gesture_progress() -> float:
-    if _gesture_state["tucked_since"] is None:
-        return 0.0
-    elapsed = time.time() - _gesture_state["tucked_since"]
-    return min(1.0, elapsed / config.HELP_GESTURE_TUCKED_HOLD_SECONDS)
+class HelpGestureDetector:
+    """
+    Rilevatore del "Signal for Help" con stato e istanza MediaPipe Hands PROPRI.
+
+    Ogni telecamera deve avere il suo detector: lo stato del gesto (palmo aperto →
+    pugno col pollice ripiegato) e il grafo MediaPipe non sono condivisibili tra
+    più stream senza falsare i rilevamenti.
+    """
+
+    def __init__(self):
+        self.hands = mp_hands.Hands(
+            max_num_hands=2,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        self._state = {"open_since": None, "open_seen_at": None, "tucked_since": None}
+
+    def progress(self) -> float:
+        if self._state["tucked_since"] is None:
+            return 0.0
+        elapsed = time.time() - self._state["tucked_since"]
+        return min(1.0, elapsed / config.HELP_GESTURE_TUCKED_HOLD_SECONDS)
+
+    def detect(self, frame) -> bool:
+        """
+        Rileva il "Signal for Help": palmo aperto seguito, entro pochi secondi,
+        da un pugno chiuso col pollice ripiegato dentro il palmo.
+        Soglie basate sul tempo reale (secondi), non su conteggio frame,
+        così funzionano a qualsiasi framerate della pipeline.
+        Disegna gli skeleton delle mani sul frame passato (in-place).
+        """
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = self.hands.process(rgb)
+        if not result.multi_hand_landmarks:
+            self._state["tucked_since"] = None
+            self._state["open_since"] = None
+            return False
+
+        triggered = False
+        now = time.time()
+
+        for hand_landmarks in result.multi_hand_landmarks:
+            mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            lm = hand_landmarks.landmark
+            diag = _hand_diag(lm)
+
+            if _is_open_palm(lm, diag):
+                if self._state["open_since"] is None:
+                    self._state["open_since"] = now
+                if now - self._state["open_since"] >= config.HELP_GESTURE_OPEN_HOLD_SECONDS:
+                    self._state["open_seen_at"] = now
+                self._state["tucked_since"] = None
+
+            elif _is_thumb_tucked_fist(lm, diag):
+                self._state["open_since"] = None
+                open_at = self._state["open_seen_at"]
+                if open_at is not None and now - open_at <= config.HELP_GESTURE_WINDOW_SECONDS:
+                    if self._state["tucked_since"] is None:
+                        self._state["tucked_since"] = now
+                    if now - self._state["tucked_since"] >= config.HELP_GESTURE_TUCKED_HOLD_SECONDS:
+                        triggered = True
+                        self._state["open_seen_at"] = None
+                        self._state["tucked_since"] = None
+            else:
+                self._state["open_since"] = None
+                self._state["tucked_since"] = None
+
+        return triggered
+
+    def close(self):
+        try:
+            self.hands.close()
+        except Exception:
+            pass
+
+
+# ============================================================
+# Compatibilità con codice legacy (singola telecamera):
+# main_pc_backup.py e altri usano le funzioni a livello di modulo.
+# ============================================================
+_default_detector = None
+
+
+def _get_default() -> HelpGestureDetector:
+    global _default_detector
+    if _default_detector is None:
+        _default_detector = HelpGestureDetector()
+    return _default_detector
 
 
 def detect_help_gesture(frame) -> bool:
-    """
-    Rileva il "Signal for Help": palmo aperto seguito, entro pochi secondi,
-    da un pugno chiuso col pollice ripiegato dentro il palmo.
-    Soglie basate sul tempo reale (secondi), non su conteggio frame,
-    cosi' funzionano a qualsiasi framerate della pipeline.
-    """
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = hands.process(rgb)
-    if not result.multi_hand_landmarks:
-        _gesture_state["tucked_since"] = None
-        _gesture_state["open_since"] = None
-        return False
+    return _get_default().detect(frame)
 
-    triggered = False
-    now = time.time()
 
-    for hand_landmarks in result.multi_hand_landmarks:
-        mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-        lm = hand_landmarks.landmark
-        diag = _hand_diag(lm)
-
-        if _is_open_palm(lm, diag):
-            if _gesture_state["open_since"] is None:
-                _gesture_state["open_since"] = now
-            if now - _gesture_state["open_since"] >= config.HELP_GESTURE_OPEN_HOLD_SECONDS:
-                _gesture_state["open_seen_at"] = now
-            _gesture_state["tucked_since"] = None
-
-        elif _is_thumb_tucked_fist(lm, diag):
-            _gesture_state["open_since"] = None
-            open_at = _gesture_state["open_seen_at"]
-            if open_at is not None and now - open_at <= config.HELP_GESTURE_WINDOW_SECONDS:
-                if _gesture_state["tucked_since"] is None:
-                    _gesture_state["tucked_since"] = now
-                if now - _gesture_state["tucked_since"] >= config.HELP_GESTURE_TUCKED_HOLD_SECONDS:
-                    triggered = True
-                    _gesture_state["open_seen_at"] = None
-                    _gesture_state["tucked_since"] = None
-        else:
-            _gesture_state["open_since"] = None
-            _gesture_state["tucked_since"] = None
-
-    return triggered
+def gesture_progress() -> float:
+    return _get_default().progress()

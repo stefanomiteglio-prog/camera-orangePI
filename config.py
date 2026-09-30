@@ -6,18 +6,52 @@ device_id da usare per far apparire questo nodo come un sensore ESP32
 nel backend TreeEyes.
 """
 
-# --- Sorgente video -----------------------------------------------------
-CAMERA_INDEX = "/dev/v4l/by-id/usb-USB_Cam_Manufacturer_HDMI_USB_Camera_88901c069d01ae53-video-index0"         # Punta a /dev/video1 (HDMI USB Camera)
-# CAMERA_INDEX = "/dev/v4l/by-id/usb-Sonix_Technology_Co.__Ltd._USB_2.0_Camera_SN5100-video-index0"         # 0 = prima webcam disponibile. Cambia se usi una IP cam (vedi note in main.py)
-
-# Risoluzione acquisizione (720p per massima efficienza, alzare a 1920x1080 se serve più dettaglio)
+# --- Sorgente video: risoluzione/fps di default per ogni telecamera -----
+# Valori usati da una voce di CAMERAS quando non specifica width/height/fps.
+# 720p per massima efficienza; alzare a 1920x1080 se serve più dettaglio.
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CAMERA_FPS = 30
 
-# --- Identificazione Dispositivo (MAC Address) ----------------------------
-# Deve corrispondere al MAC address censito nel backend (es. c0:74:2b:fb:00:3f o mini_cam_01)
-DEVICE_ID = "c0:74:2b:fb:00:3f"
+# --- Telecamere multiple (Zona A / Zona B) -------------------------------
+# Ogni telecamera invia al backend con il PROPRIO 'device_id' (stringa libera,
+# NON più un unico MAC). Registra questi device_id nella lista dispositivi del
+# server, uno per zona.
+#
+# 'camera_index' è il path stabile V4L2 by-id: identifica fisicamente la
+# telecamera indipendentemente dall'ordine di enumerazione USB all'avvio.
+# (Su Windows/PC per un test locale puoi mettere un intero: 0, 1, ...)
+CAMERAS = [
+    {
+        "device_id": "treeeyes_zona_a",
+        "zone": "Zona A",
+        "camera_index": "/dev/v4l/by-id/usb-Sonix_Technology_Co.__Ltd._USB_2.0_Camera-video-index0",
+        "width": CAMERA_WIDTH,
+        "height": CAMERA_HEIGHT,
+        "fps": CAMERA_FPS,
+    },
+    {
+        "device_id": "treeeyes_zona_b",
+        "zone": "Zona B",
+        "camera_index": "/dev/v4l/by-id/usb-Sonix_Technology_Co.__Ltd._USB_2.0_Camera_SN5100-video-index0",
+        "width": CAMERA_WIDTH,
+        "height": CAMERA_HEIGHT,
+        "fps": CAMERA_FPS,
+    },
+]
+
+# --- Retrocompatibilità (single-camera: main_pc_backup.py, test_camera.py) -
+# Alias sulla prima telecamera, così i vecchi script a singola telecamera
+# continuano a funzionare senza modifiche.
+CAMERA_INDEX = CAMERAS[0]["camera_index"]
+
+# device_id di fallback, usato SOLO se una funzione viene chiamata senza un
+# device_id esplicito. Con il multi-camera ogni pipeline passa sempre il proprio.
+DEVICE_ID = CAMERAS[0]["device_id"]
+
+# client_id univoco della connessione MQTT (una sola connessione condivisa da
+# entrambe le telecamere, che pubblicano ciascuna sul proprio topic).
+MQTT_CLIENT_ID = "treeeyes-vision-node"
 
 # --- Backend HTTP REST ---------------------------------------------------
 # Host Backend HTTP: http://<IP_SERVER>:8000 (o porta 5173 se tramite reverse-proxy)
