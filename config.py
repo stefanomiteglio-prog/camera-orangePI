@@ -8,10 +8,21 @@ nel backend TreeEyes.
 
 # --- Sorgente video: risoluzione/fps di default per ogni telecamera -----
 # Valori usati da una voce di CAMERAS quando non specifica width/height/fps.
-# 720p per massima efficienza; alzare a 1920x1080 se serve più dettaglio.
-CAMERA_WIDTH = 1280
-CAMERA_HEIGHT = 720
+# Con DUE telecamere in parallelo si privilegia il framerate: 640x480 alleggerisce
+# bus USB, resize e MediaPipe (i modelli NPU lavorano comunque a 640 in input,
+# quindi la detection perde poco). Per più dettaglio: 800x600 o 1280x720.
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
+
+# --- Cadenza inferenze (1 = ogni frame, 2 = un frame sì e uno no, ...) ----
+# Alzare questi valori aumenta gli FPS a scapito della reattività del rilevatore.
+POSE_PROCESS_EVERY = 1     # stima pose/scheletro + caduta
+DETECT_PROCESS_EVERY = 2   # detection oggetti (armi/persone)
+HANDS_PROCESS_EVERY = 3    # gesto aiuto (MediaPipe, il più costoso su CPU)
+
+# Complessità del modello MediaPipe Hands: 0 = lite (veloce), 1 = full (preciso)
+HANDS_MODEL_COMPLEXITY = 0
 
 # --- Telecamere multiple (Zona A / Zona B) -------------------------------
 # Ogni telecamera invia al backend con il PROPRIO 'device_id' (stringa libera,

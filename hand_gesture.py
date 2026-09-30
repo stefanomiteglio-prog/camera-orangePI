@@ -58,6 +58,7 @@ class HelpGestureDetector:
     def __init__(self):
         self.hands = mp_hands.Hands(
             max_num_hands=2,
+            model_complexity=getattr(config, "HANDS_MODEL_COMPLEXITY", 0),
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )

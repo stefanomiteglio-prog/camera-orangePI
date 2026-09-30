@@ -209,17 +209,19 @@ class CameraPipeline(threading.Thread):
     di rendering (con HUD ed etichette), che il thread principale compone e mostra.
     """
 
-    def __init__(self, cam_cfg, detect_model, pose_model, detect_lock, pose_lock, mqtt_client):
+    def __init__(self, cam_cfg, mqtt_client):
         super().__init__(daemon=True)
         self.cam_cfg = cam_cfg
         self.device_id = cam_cfg["device_id"]
         self.zone = cam_cfg.get("zone", self.device_id)
-
-        self.detect_model = detect_model
-        self.pose_model = pose_model
-        self.detect_lock = detect_lock
-        self.pose_lock = pose_lock
         self.mqtt_client = mqtt_client
+
+        # Modelli NPU PROPRI della pipeline, su NPU_CORE_AUTO: il runtime RKNN
+        # bilancia le inferenze delle due telecamere sui 3 core del RK3588,
+        # ottenendo vero parallelismo (niente lock che serializza su un core solo).
+        logger.info(f"[{self.zone}] Caricamento modelli NPU dedicati (AUTO core)...")
+        self.detect_model = DetectModel(DETECT_RKNN_PATH, core_mask=RKNNLite.NPU_CORE_AUTO, conf_thresh=config.CONF_THRESHOLD)
+        self.pose_model = PoseModel(POSE_RKNN_PATH, core_mask=RKNNLite.NPU_CORE_AUTO, conf_thresh=config.CONF_THRESHOLD)
 
         self.capture = None
         self.gesture = HelpGestureDetector()
@@ -227,11 +229,17 @@ class CameraPipeline(threading.Thread):
         self.tracker = SimpleTracker()
         self.executor = ThreadPoolExecutor(max_workers=3)
 
+        # Cadenze inferenza (configurabili)
+        self.pose_every = max(1, getattr(config, "POSE_PROCESS_EVERY", 1))
+        self.detect_every = max(1, getattr(config, "DETECT_PROCESS_EVERY", 2))
+        self.hands_every = max(1, getattr(config, "HANDS_PROCESS_EVERY", 3))
+
         self.consecutive_counts = {}
         self.last_event_time = {}
         self.crowd_start_time = None
         self.frame_idx = 0
         self.last_detections = []
+        self.last_pose = []
 
         self._fps = 0.0
         self._last_fps_t = time.time()
@@ -239,15 +247,6 @@ class CameraPipeline(threading.Thread):
         self.latest_display = None
         self.display_lock = threading.Lock()
         self.running = False
-
-    # ----- accesso NPU serializzato -----
-    def _infer_pose(self, frame):
-        with self.pose_lock:
-            return self.pose_model.infer(frame)
-
-    def _infer_detect(self, frame):
-        with self.detect_lock:
-            return self.detect_model.infer(frame)
 
     def reset(self):
         self.last_event_time.clear()
@@ -305,18 +304,25 @@ class CameraPipeline(threading.Thread):
             detected_this_frame = set()
             person_count = 0
 
-            # 2. Inferenze in parallelo su thread dedicati usando il frame raw
-            small_raw = cv2.resize(raw_frame, (raw_frame.shape[1] // 2, raw_frame.shape[0] // 2))
+            # 2. Inferenze in parallelo su thread dedicati, con cadenze indipendenti.
+            #    I risultati vengono riusati nei frame in cui l'inferenza è saltata.
+            futures = {}
+            if self.frame_idx % self.pose_every == 0:
+                futures["pose"] = self.executor.submit(self.pose_model.infer, raw_frame)
+            if self.frame_idx % self.detect_every == 0:
+                futures["detect"] = self.executor.submit(self.detect_model.infer, raw_frame)
+            if self.frame_idx % self.hands_every == 0:
+                small_raw = cv2.resize(raw_frame, (raw_frame.shape[1] // 2, raw_frame.shape[0] // 2))
+                futures["hands"] = self.executor.submit(self.gesture.detect, small_raw)
 
-            pose_future = self.executor.submit(self._infer_pose, raw_frame)
-            hands_future = self.executor.submit(self.gesture.detect, small_raw)
-            if self.frame_idx % 2 == 0:
-                detect_future = self.executor.submit(self._infer_detect, raw_frame)
-                self.last_detections = detect_future.result()
+            if "pose" in futures:
+                self.last_pose = futures["pose"].result()
+            if "detect" in futures:
+                self.last_detections = futures["detect"].result()
+            gesture_triggered = futures["hands"].result() if "hands" in futures else False
+
+            pose_results = self.last_pose
             detections = self.last_detections
-
-            pose_results = pose_future.result()
-            gesture_triggered = hands_future.result()
 
             # 3. Frame di rendering dedicato all'HUD
             display_frame = raw_frame.copy()
@@ -424,6 +430,11 @@ class CameraPipeline(threading.Thread):
             self.capture.release()
         self.executor.shutdown(wait=False)
         self.gesture.close()
+        try:
+            self.detect_model.release()
+            self.pose_model.release()
+        except Exception:
+            pass
 
 
 def _placeholder(zone, width=1280, height=720):
@@ -462,12 +473,6 @@ def compose_grid(pipelines, target_h=720):
 
 
 def main():
-    logger.info("Caricamento modelli RKNN (condivisi tra le telecamere)...")
-    detect_model = DetectModel(DETECT_RKNN_PATH, core_mask=RKNNLite.NPU_CORE_0, conf_thresh=config.CONF_THRESHOLD)
-    pose_model = PoseModel(POSE_RKNN_PATH, core_mask=RKNNLite.NPU_CORE_1, conf_thresh=config.CONF_THRESHOLD)
-    detect_lock = threading.Lock()
-    pose_lock = threading.Lock()
-
     cameras = getattr(config, "CAMERAS", None)
     if not cameras:
         raise RuntimeError("Nessuna telecamera definita in config.CAMERAS")
@@ -490,11 +495,8 @@ def main():
     cleanup_old_files(getattr(config, "VIDEO_CLIP_DIR", "clips"), getattr(config, "MAX_CLIPS_COUNT", 100))
     last_cleanup_time = time.time()
 
-    # 4. Avvio pipeline (una per telecamera)
-    pipelines = [
-        CameraPipeline(cam, detect_model, pose_model, detect_lock, pose_lock, mqtt_client)
-        for cam in cameras
-    ]
+    # 4. Avvio pipeline (una per telecamera, con modelli NPU dedicati)
+    pipelines = [CameraPipeline(cam, mqtt_client) for cam in cameras]
     for p in pipelines:
         p.start()
 
@@ -563,8 +565,6 @@ def main():
             p.join(timeout=2.0)
         if not getattr(config, "HEADLESS", False):
             cv2.destroyAllWindows()
-        detect_model.release()
-        pose_model.release()
         for hb in heartbeat_services:
             if hb is not None:
                 hb.stop()
