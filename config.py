@@ -18,7 +18,8 @@ CAMERA_FPS = 30
 # --- Cadenza inferenze (1 = ogni frame, 2 = un frame sì e uno no, ...) ----
 # Alzare questi valori aumenta gli FPS a scapito della reattività del rilevatore.
 POSE_PROCESS_EVERY = 1     # stima pose/scheletro + caduta
-DETECT_PROCESS_EVERY = 2   # detection oggetti (armi/persone)
+DETECT_PROCESS_EVERY = 2   # detection oggetti COCO (persone/bastone/coltello)
+WEAPON_PROCESS_EVERY = 2   # detection armi (weapon_threat.rknn), sfalsata di un frame rispetto a COCO
 HANDS_PROCESS_EVERY = 3    # gesto aiuto (MediaPipe, il più costoso su CPU)
 
 # Complessità del modello MediaPipe Hands: 0 = lite (veloce), 1 = full (preciso)
@@ -101,6 +102,23 @@ POSE_RKNN_PATH = "yolov8s-pose.rknn"
 DETECT_RKNN_PATH = "rknn_test/rknn_model_zoo/examples/yolov8/model/yolov8n.rknn"
 RKNN_TARGET = "rk3588"
 
+# Modello dedicato armi/minacce (presente solo sull'Orange Pi, nella cartella
+# del progetto). Se il file manca il nodo parte comunque, senza questo modello.
+WEAPON_ENABLED = True
+WEAPON_RKNN_PATH = "weapon_threat.rknn"
+# Ordine delle classi = ordine di addestramento del modello: NON cambiarlo.
+WEAPON_CLASSES = ["Gun", "explosion", "grenade", "knife"]
+# Soglia dedicata: più alta di CONF_THRESHOLD perché il modello tende ai falsi
+# positivi a bassa confidenza (nel test a 0.10 riconosce "qualsiasi oggetto").
+WEAPON_CONF_THRESHOLD = 0.35
+# Classe del modello -> alert_type inviato al backend
+WEAPON_CLASS_MAP = {
+    "Gun": "arma_da_fuoco",
+    "explosion": "esplosione",
+    "grenade": "granata",
+    "knife": "coltello",
+}
+
 # Modelli PyTorch (usati nel test locale o fallback PC)
 YOLO_WEIGHTS = "yolov8s.pt"
 YOLO_POSE_WEIGHTS = "yolov8s-pose.pt"
@@ -124,8 +142,10 @@ CONF_THRESHOLD = 0.3
 # Classi COCO gia' presenti nel modello pre-addestrato che ci interessano.
 # COCO include gia' "knife" (coltello) e "baseball bat" (bastone) di serie.
 # Fuoco/fumo NON e' una classe COCO: richiede un modello dedicato (vedi README).
+# "knife" usa lo stesso alert_type del modello armi (WEAPON_CLASS_MAP), così i
+# due modelli condividono contatore e cooldown e non generano allarmi doppi.
 DANGER_CLASS_MAP = {
-    "knife": "arma",
+    "knife": "coltello",
     "baseball bat": "arma",
 }
 
@@ -137,6 +157,10 @@ EVENT_COOLDOWN_SECONDS = 5
 EVENT_COOLDOWN_MAP = {
     "segnale_aiuto": 5,             # Cooldown 5s per gesto aiuto (specifica)
     "arma": 10,
+    "arma_da_fuoco": 10,
+    "coltello": 10,
+    "granata": 10,
+    "esplosione": 10,
     "persona_a_terra": 10,
     "assembramento": 30,
 }
@@ -173,7 +197,7 @@ VIDEO_CLIP_ENABLED = True
 VIDEO_CLIP_PRE_SECONDS = 5          # Buffer 5s prima dell'evento
 VIDEO_CLIP_POST_SECONDS = 5         # Buffer 5s dopo l'evento (3-5s da specifiche)
 VIDEO_CLIP_DIR = "clips"
-VIDEO_CLIP_TRIGGER_TYPES = {"arma", "persona_a_terra", "fuoco_fumo", "segnale_aiuto", "assembramento"}
+VIDEO_CLIP_TRIGGER_TYPES = {"arma", "arma_da_fuoco", "coltello", "granata", "esplosione", "persona_a_terra", "fuoco_fumo", "segnale_aiuto", "assembramento"}
 
 VLM_ENABLED = True
 VLM_ENDPOINT = "http://localhost:11434/api/generate"
@@ -182,6 +206,10 @@ VLM_TIMEOUT_SECONDS = 60
 
 VLM_QUESTIONS = {
     "arma": "Nell'immagine e' visibile un'arma (coltello, bastone, oggetto usato come arma) impugnata o minacciosamente vicino a una persona?",
+    "arma_da_fuoco": "Nell'immagine e' visibile un'arma da fuoco (pistola, fucile) impugnata o vicino a una persona?",
+    "coltello": "Nell'immagine e' visibile un coltello o una lama impugnata o minacciosamente vicino a una persona?",
+    "granata": "Nell'immagine e' visibile una granata o un ordigno esplosivo?",
+    "esplosione": "Nell'immagine e' visibile un'esplosione reale (fiammata, palla di fuoco, nube di detriti)?",
     "persona_a_terra": "Nell'immagine c'e' una persona sdraiata o accasciata a terra, come se fosse caduta o ferita?",
     "fuoco_fumo": "Nell'immagine e' visibile fuoco o fumo reale?",
     "assembramento": "Nell'immagine c'e' un gruppo insolitamente numeroso di persone assembrate?",

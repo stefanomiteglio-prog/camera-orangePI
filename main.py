@@ -22,10 +22,12 @@ import hud
 import vlm_confirm
 from video_clip import ClipRecorder
 from logger import logger
-from rknn_backend import PoseModel, DetectModel, SimpleTracker, POSE_SKELETON
+from rknn_backend import PoseModel, DetectModel, WeaponModel, SimpleTracker, POSE_SKELETON, WEAPON_CLASSES
 
 POSE_RKNN_PATH = getattr(config, "POSE_RKNN_PATH", "yolov8s-pose.rknn")
 DETECT_RKNN_PATH = getattr(config, "DETECT_RKNN_PATH", "rknn_test/rknn_model_zoo/examples/yolov8/model/yolov8n.rknn")
+WEAPON_RKNN_PATH = getattr(config, "WEAPON_RKNN_PATH", "weapon_threat.rknn")
+WEAPON_CLASS_MAP = getattr(config, "WEAPON_CLASS_MAP", {})
 RKNN_TARGET = getattr(config, "RKNN_TARGET", "rk3588")
 
 
@@ -223,15 +225,30 @@ class CameraPipeline(threading.Thread):
         self.detect_model = DetectModel(DETECT_RKNN_PATH, core_mask=RKNNLite.NPU_CORE_AUTO, conf_thresh=config.CONF_THRESHOLD)
         self.pose_model = PoseModel(POSE_RKNN_PATH, core_mask=RKNNLite.NPU_CORE_AUTO, conf_thresh=config.CONF_THRESHOLD)
 
+        # Modello armi dedicato (Gun/explosion/grenade/knife). Opzionale: se il
+        # file .rknn manca la pipeline prosegue con i soli modelli COCO/pose.
+        self.weapon_model = None
+        if getattr(config, "WEAPON_ENABLED", True):
+            try:
+                self.weapon_model = WeaponModel(
+                    WEAPON_RKNN_PATH,
+                    core_mask=RKNNLite.NPU_CORE_AUTO,
+                    conf_thresh=getattr(config, "WEAPON_CONF_THRESHOLD", 0.35),
+                    classes=getattr(config, "WEAPON_CLASSES", WEAPON_CLASSES),
+                )
+            except Exception as e:
+                logger.error(f"[{self.zone}] Modello armi '{WEAPON_RKNN_PATH}' non caricato ({e}): rilevamento armi dedicato disattivato.")
+
         self.capture = None
         self.gesture = HelpGestureDetector()
         self.clip = ClipRecorder(device_id=self.device_id)
         self.tracker = SimpleTracker()
-        self.executor = ThreadPoolExecutor(max_workers=3)
+        self.executor = ThreadPoolExecutor(max_workers=4)
 
         # Cadenze inferenza (configurabili)
         self.pose_every = max(1, getattr(config, "POSE_PROCESS_EVERY", 1))
         self.detect_every = max(1, getattr(config, "DETECT_PROCESS_EVERY", 2))
+        self.weapon_every = max(1, getattr(config, "WEAPON_PROCESS_EVERY", 2))
         self.hands_every = max(1, getattr(config, "HANDS_PROCESS_EVERY", 3))
 
         self.consecutive_counts = {}
@@ -239,6 +256,7 @@ class CameraPipeline(threading.Thread):
         self.crowd_start_time = None
         self.frame_idx = 0
         self.last_detections = []
+        self.last_weapons = []
         self.last_pose = []
 
         self._fps = 0.0
@@ -311,6 +329,9 @@ class CameraPipeline(threading.Thread):
                 futures["pose"] = self.executor.submit(self.pose_model.infer, raw_frame)
             if self.frame_idx % self.detect_every == 0:
                 futures["detect"] = self.executor.submit(self.detect_model.infer, raw_frame)
+            # Sfalsata di un frame rispetto a COCO per non sommare i due carichi NPU
+            if self.weapon_model is not None and (self.frame_idx + 1) % self.weapon_every == 0:
+                futures["weapon"] = self.executor.submit(self.weapon_model.infer, raw_frame)
             if self.frame_idx % self.hands_every == 0:
                 small_raw = cv2.resize(raw_frame, (raw_frame.shape[1] // 2, raw_frame.shape[0] // 2))
                 futures["hands"] = self.executor.submit(self.gesture.detect, small_raw)
@@ -319,6 +340,8 @@ class CameraPipeline(threading.Thread):
                 self.last_pose = futures["pose"].result()
             if "detect" in futures:
                 self.last_detections = futures["detect"].result()
+            if "weapon" in futures:
+                self.last_weapons = futures["weapon"].result()
             gesture_triggered = futures["hands"].result() if "hands" in futures else False
 
             pose_results = self.last_pose
@@ -327,22 +350,35 @@ class CameraPipeline(threading.Thread):
             # 3. Frame di rendering dedicato all'HUD
             display_frame = raw_frame.copy()
 
-            # --- Analisi Oggetti Pericolosi ---
+            # --- Analisi Oggetti Pericolosi (COCO + modello armi dedicato) ---
+            # danger_type -> confidenza migliore nel frame: ogni tipo conta una
+            # sola volta per frame anche se visto da entrambi i modelli.
+            dangers = {}
+            danger_dets = []
             for det in detections:
                 class_name = det["class_name"].strip()
-                confidence = det["score"]
                 if class_name == "person":
                     person_count += 1
                 if class_name in config.DANGER_CLASS_MAP:
-                    danger_type = config.DANGER_CLASS_MAP[class_name]
-                    detected_this_frame.add(danger_type)
-                    x1, y1, x2, y2 = map(int, det["box"])
-                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                    cv2.putText(display_frame, f"{class_name} {confidence:.2f}", (x1, y1 - 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                    self.consecutive_counts[danger_type] = self.consecutive_counts.get(danger_type, 0) + 1
-                    if self.consecutive_counts[danger_type] >= config.CONSECUTIVE_FRAMES_THRESHOLD:
-                        self._fire_event(now, danger_type, confidence, raw_frame)
+                    danger_dets.append((config.DANGER_CLASS_MAP[class_name], class_name, det))
+            for det in self.last_weapons:
+                class_name = det["class_name"]
+                if class_name in WEAPON_CLASS_MAP:
+                    danger_dets.append((WEAPON_CLASS_MAP[class_name], class_name, det))
+
+            for danger_type, class_name, det in danger_dets:
+                confidence = det["score"]
+                dangers[danger_type] = max(dangers.get(danger_type, 0.0), confidence)
+                x1, y1, x2, y2 = map(int, det["box"])
+                cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                cv2.putText(display_frame, f"{class_name} {confidence:.2f}", (x1, max(20, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+            for danger_type, confidence in dangers.items():
+                detected_this_frame.add(danger_type)
+                self.consecutive_counts[danger_type] = self.consecutive_counts.get(danger_type, 0) + 1
+                if self.consecutive_counts[danger_type] >= config.CONSECUTIVE_FRAMES_THRESHOLD:
+                    self._fire_event(now, danger_type, confidence, raw_frame)
 
             # --- Analisi Pose e Caduta ---
             tracked = self.tracker.update(pose_results)
@@ -404,6 +440,7 @@ class CameraPipeline(threading.Thread):
             hud.draw_progress_bar(display_frame, "Gesto aiuto", self.gesture.progress())
             hud.draw_panel(display_frame, [
                 ("Persone", False, f"({person_count})"),
+                ("Arma", bool(dangers), f"({', '.join(dangers)})" if dangers else ""),
                 ("Caduta", "persona_a_terra" in detected_this_frame, ""),
                 ("Assembramento", self.crowd_start_time is not None, ""),
                 ("Gesto aiuto", gesture_triggered, ""),
@@ -433,6 +470,8 @@ class CameraPipeline(threading.Thread):
         try:
             self.detect_model.release()
             self.pose_model.release()
+            if self.weapon_model is not None:
+                self.weapon_model.release()
         except Exception:
             pass
 

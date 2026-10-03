@@ -89,6 +89,49 @@ class PoseModel:
         self.rknn.release()
 
 
+WEAPON_CLASSES = ("Gun", "explosion", "grenade", "knife")
+
+
+class WeaponModel:
+    """
+    Modello armi/minacce (weapon_threat.rknn): head YOLOv8 a output singolo
+    (1, 4+num_classi, 8400) con box cx,cy,w,h e score per classe gia' decodificati.
+    """
+    def __init__(self, model_path, core_mask=RKNNLite.NPU_CORE_2, conf_thresh=0.35, nms_thresh=0.45, input_size=640, classes=WEAPON_CLASSES):
+        self.rknn = _make_rknnlite(model_path, core_mask)
+        self.conf_thresh = conf_thresh
+        self.nms_thresh = nms_thresh
+        self.input_size = input_size
+        self.classes = tuple(classes)
+
+    _nms = PoseModel._nms
+
+    def infer(self, frame):
+        img, ratio, dx, dy = letterbox(frame, self.input_size)
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        outputs = self.rknn.inference(inputs=[np.expand_dims(rgb, axis=0)])
+        out = outputs[0][0].transpose(1, 0)
+        class_scores = out[:, 4:4 + len(self.classes)]
+        cls_ids = np.argmax(class_scores, axis=1)
+        scores = np.max(class_scores, axis=1)
+        mask = scores >= self.conf_thresh
+        out = out[mask]; cls_ids = cls_ids[mask]; scores = scores[mask]
+        results = []
+        if len(out) == 0:
+            return results
+        cx, cy, w, h = out[:,0], out[:,1], out[:,2], out[:,3]
+        boxes = np.stack([cx-w/2, cy-h/2, cx+w/2, cy+h/2], axis=1)
+        keep = self._nms(boxes, scores)
+        for i in keep:
+            b = boxes[i]
+            x1 = (b[0]-dx)/ratio; y1=(b[1]-dy)/ratio; x2=(b[2]-dx)/ratio; y2=(b[3]-dy)/ratio
+            results.append({"box":[x1,y1,x2,y2], "score": float(scores[i]), "class_id": int(cls_ids[i]), "class_name": self.classes[int(cls_ids[i])]})
+        return results
+
+    def release(self):
+        self.rknn.release()
+
+
 def _dfl(position):
     n, c, h, w = position.shape
     p_num = 4
