@@ -11,6 +11,7 @@ import config
 from events import (
     build_mqtt_client,
     publish_event,
+    publish_presence,
     start_heartbeat,
     notify_telegram,
     verify_handshake,
@@ -91,8 +92,13 @@ def _process_event_async(device_id, zone, danger_type, confidence, snapshot_path
 
 def open_capture(cam_cfg):
     source = cam_cfg["camera_index"]
+    # Path V4L2 assente = telecamera scollegata: inutile tentare l'apertura
+    if isinstance(source, str) and source.startswith("/dev/") and not os.path.exists(source):
+        raise RuntimeError(f"Dispositivo non presente: {source}")
+
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
+        cap.release()
         raise RuntimeError(f"Impossibile aprire la sorgente video: {source}")
 
     # Imposta formato MJPG se disponibile (riduce il carico del bus USB)
@@ -136,15 +142,40 @@ class VideoCaptureThread:
         self.new_frame_event = threading.Event()
         self.consecutive_failures = 0
         self.worker_thread = None
+        # True mentre la telecamera è assente: evita di ripetere lo stesso log
+        # a ogni tentativo di riconnessione (uno al secondo).
+        self.waiting = False
         self._init_cap()
 
     def _init_cap(self):
+        zone = self.cam_cfg.get("zone", "?")
         try:
             self.cap = open_capture(self.cam_cfg)
             self.consecutive_failures = 0
+            if self.waiting:
+                logger.info(f"[{zone}] Telecamera ricollegata.")
+            self.waiting = False
         except Exception as e:
-            logger.error(f"[{self.cam_cfg.get('zone', '?')}] Inizializzazione capture fallita: {e}")
+            if not self.waiting:
+                logger.error(f"[{zone}] Telecamera non disponibile ({e}): in attesa che venga collegata...")
+            self.waiting = True
             self.cap = None
+
+    def _drop_cap(self):
+        """Rilascia la capture e scarta l'ultimo frame (telecamera persa)."""
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+        self.cap = None
+        with self.lock:
+            self.frame = None
+        self.new_frame_event.clear()
+
+    def _device_missing(self):
+        source = self.cam_cfg["camera_index"]
+        return isinstance(source, str) and source.startswith("/dev/") and not os.path.exists(source)
 
     def start(self):
         self.running = True
@@ -153,23 +184,28 @@ class VideoCaptureThread:
         return self
 
     def _loop(self):
+        zone = self.cam_cfg.get("zone", "?")
         while self.running:
             if self.cap is None or not self.cap.isOpened():
                 time.sleep(1.0)
                 self._init_cap()
                 continue
 
-            ok, frame = self.cap.read()
-            if not ok:
+            try:
+                ok, frame = self.cap.read()
+            except Exception as e:
+                logger.error(f"[{zone}] Errore lettura frame: {e}")
+                ok, frame = False, None
+
+            if not ok or frame is None or frame.size == 0:
                 self.consecutive_failures += 1
-                if self.consecutive_failures >= 10:
-                    logger.warning(f"[{self.cam_cfg.get('zone', '?')}] Riconnessione webcam...")
-                    try:
-                        self.cap.release()
-                    except Exception:
-                        pass
-                    self.cap = None
-                    time.sleep(2.0)
+                # Device sparito da /dev = cavo staccato: inutile attendere altri errori
+                if self.consecutive_failures >= 10 or self._device_missing():
+                    if not self.waiting:
+                        logger.warning(f"[{zone}] Telecamera scollegata: in attesa che venga ricollegata...")
+                    self.waiting = True
+                    self._drop_cap()
+                    time.sleep(1.0)
                 else:
                     time.sleep(0.02)
                 continue
@@ -254,6 +290,8 @@ class CameraPipeline(threading.Thread):
         self.consecutive_counts = {}
         self.last_event_time = {}
         self.crowd_start_time = None
+        self.presence_frames = 0
+        self.last_presence_time = 0.0
         self.frame_idx = 0
         self.last_detections = []
         self.last_weapons = []
@@ -265,6 +303,7 @@ class CameraPipeline(threading.Thread):
         self.latest_display = None
         self.display_lock = threading.Lock()
         self.running = False
+        self.signal_lost = False
 
     def reset(self):
         self.last_event_time.clear()
@@ -303,15 +342,51 @@ class CameraPipeline(threading.Thread):
     def stop(self):
         self.running = False
 
+    def _on_signal_lost(self):
+        """
+        Telecamera assente/scollegata: la pipeline resta viva in attesa dei frame.
+        Azzera lo stato (così al ritorno non scattano allarmi su dati vecchi) e
+        libera il display, che torna al riquadro "IN ATTESA SEGNALE".
+        """
+        if self.signal_lost:
+            return
+        self.signal_lost = True
+        logger.warning(f"[{self.zone}] Nessun segnale video: pipeline in attesa della telecamera.")
+        with self.display_lock:
+            self.latest_display = None
+        self.consecutive_counts.clear()
+        self.crowd_start_time = None
+        self.presence_frames = 0
+        self.last_detections = []
+        self.last_weapons = []
+        self.last_pose = []
+        self._fps = 0.0
+        self.clip.flush()
+
     def run(self):
         self.running = True
         self.capture = VideoCaptureThread(self.cam_cfg).start()
 
+        # Un errore su un frame (o su una telecamera) non deve fermare il thread:
+        # si logga e il ciclo riparte.
+        while self.running:
+            try:
+                self._run_loop()
+            except Exception:
+                logger.exception(f"[{self.zone}] Errore nella pipeline, il ciclo riparte.")
+                time.sleep(0.5)
+
+        self._cleanup()
+
+    def _run_loop(self):
         while self.running:
             ok, raw_frame = self.capture.read(timeout=1.5)
             if not ok:
-                logger.warning(f"[{self.zone}] Frame non disponibile o timeout cattura.")
+                self._on_signal_lost()
                 continue
+            if self.signal_lost:
+                self.signal_lost = False
+                logger.info(f"[{self.zone}] Segnale video ripristinato.")
 
             now = time.time()
             self.frame_idx += 1
@@ -416,6 +491,18 @@ class CameraPipeline(threading.Thread):
                 if danger_type not in detected_this_frame:
                     self.consecutive_counts[danger_type] = 0
 
+            # --- Presenza (accensione luci di zona) ---
+            # Persona vista dal detector COCO oppure dal modello pose: basta uno dei due.
+            people = max(person_count, len(tracked))
+            self.presence_frames = self.presence_frames + 1 if people > 0 else 0
+            if (
+                getattr(config, "PRESENCE_ENABLED", True)
+                and self.presence_frames >= getattr(config, "PRESENCE_MIN_FRAMES", 3)
+                and now - self.last_presence_time >= getattr(config, "PRESENCE_REPUBLISH_SECONDS", 20)
+            ):
+                self.last_presence_time = now
+                publish_presence(self.mqtt_client, people, device_id=self.device_id)
+
             # --- Assembramento ---
             if person_count >= config.CROWD_COUNT_THRESHOLD:
                 if self.crowd_start_time is None:
@@ -462,7 +549,7 @@ class CameraPipeline(threading.Thread):
                     f"allarmi_attivi={list(detected_this_frame)}, clip_rec={self.clip.is_recording()}, fps={self._fps:.1f}"
                 )
 
-        # cleanup pipeline
+    def _cleanup(self):
         if self.capture is not None:
             self.capture.release()
         self.executor.shutdown(wait=False)

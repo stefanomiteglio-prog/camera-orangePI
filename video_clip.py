@@ -34,6 +34,15 @@ class ClipRecorder:
             if now >= self.recording_until:
                 self._finalize()
 
+    def flush(self):
+        """
+        Telecamera persa: chiude subito l'eventuale clip in corso (altrimenti
+        resterebbe aperta finché non tornano i frame) e svuota il buffer pre-evento.
+        """
+        if self.recording_until is not None:
+            self._finalize()
+        self.buffer.clear()
+
     def trigger(self, danger_type: str):
         if not config.VIDEO_CLIP_ENABLED or danger_type not in config.VIDEO_CLIP_TRIGGER_TYPES:
             return

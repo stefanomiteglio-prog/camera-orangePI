@@ -320,6 +320,58 @@ def publish_event(
 
 
 # ============================================================
+# PRESENZA (ACCENSIONE LUCI DI ZONA)
+# ============================================================
+
+def publish_presence(mqtt_client, person_count: int = 1, device_id: Optional[str] = None) -> bool:
+    """
+    Segnala al backend che la telecamera vede almeno una persona nella propria
+    zona, così il backend accende le luci di quella zona.
+
+    NON è un allarme: niente snapshot/clip, e il backend non lo salva come
+    evento (non compare in webapp).
+
+    Topic: parco/<device_id>/presence
+    QoS: 1
+    Payload JSON:
+    {
+      "device_id": "treeeyes_zona_a",
+      "type": "presence",
+      "presence": true,
+      "person_count": 2,
+      "sampling_time": "2026-09-25T15:30:00Z"
+    }
+    """
+    dev = device_id or config.DEVICE_ID
+    topic = f"parco/{dev}/presence"
+
+    payload = {
+        "device_id": dev,
+        "type": "presence",
+        "presence": True,
+        "person_count": int(person_count),
+        "sampling_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+    if mqtt_client is None:
+        logger.debug(f"MQTT offline: presenza ({dev}) non inviata al broker.")
+        return False
+
+    try:
+        result = mqtt_client.publish(topic, json.dumps(payload, ensure_ascii=False), qos=1)
+        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+            logger.error(f"Errore pubblicazione presenza MQTT su {topic} (rc={result.rc})")
+            return False
+
+        logger.info(f"Presenza MQTT inviata [{dev}]: persone={int(person_count)}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Errore pubblicazione presenza MQTT: {e}")
+        return False
+
+
+# ============================================================
 # HEARTBEAT PERIODICO (BATTITO CARDIACO)
 # ============================================================
 

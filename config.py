@@ -165,6 +165,17 @@ EVENT_COOLDOWN_MAP = {
     "assembramento": 30,
 }
 
+# --- Presenza (accensione luci di zona) -----------------------------------
+# Quando la telecamera vede almeno una persona pubblica parco/<device_id>/presence:
+# il backend accende le luci della stessa zona (non è un allarme, non va in webapp).
+PRESENCE_ENABLED = True
+# Frame consecutivi con almeno una persona prima di segnalare la presenza
+PRESENCE_MIN_FRAMES = 3
+# Finché la persona resta in zona il messaggio viene ripetuto con questo intervallo,
+# per tenere accese le luci: deve restare SOTTO la durata di accensione impostata
+# sul backend (setting "presence_light_seconds", default 30s).
+PRESENCE_REPUBLISH_SECONDS = 20
+
 FALL_ASPECT_RATIO = 1.4
 FALL_TORSO_ANGLE_DEG = 55
 

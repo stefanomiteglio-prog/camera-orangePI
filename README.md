@@ -116,6 +116,31 @@ rispettivi topic `parco/<device_id>/heartbeat`.
 Parametri configurabili in `config.py`:
 - `HEARTBEAT_INTERVAL_SECONDS = 60`
 
+## Presenza (accensione luci di zona)
+
+Quando una telecamera vede almeno una persona (detector COCO o modello pose) per
+`PRESENCE_MIN_FRAMES` frame consecutivi, pubblica (`publish_presence` in `events.py`):
+- **Topic MQTT:** `parco/<device_id>/presence` (QoS 1)
+- **Payload JSON:**
+  ```json
+  {
+    "device_id": "treeeyes_zona_a",
+    "type": "presence",
+    "presence": true,
+    "person_count": 2,
+    "sampling_time": "2026-09-25T15:30:00Z"
+  }
+  ```
+Il backend accende le luci della **stessa zona** del `device_id` (campo zona del
+dispositivo: deve contenere "Zona A" / "Zona B"). Non è un allarme: nessuno
+snapshot/clip, nessun evento o pratica in webapp. Finché la persona resta in zona
+il messaggio viene ripetuto ogni `PRESENCE_REPUBLISH_SECONDS` per tenere accese le luci.
+
+Parametri configurabili in `config.py`:
+- `PRESENCE_ENABLED = True`
+- `PRESENCE_MIN_FRAMES = 3`
+- `PRESENCE_REPUBLISH_SECONDS = 20` (deve restare sotto `presence_light_seconds` del backend, default 30)
+
 ## Skeleton completo e segnale di aiuto
 
 - ✅ Skeleton corpo intero (MediaPipe Pose, 33 punti, stile "Palantir")
