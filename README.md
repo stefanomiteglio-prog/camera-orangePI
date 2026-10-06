@@ -65,8 +65,6 @@ rilevati, utile per calibrare `CONF_THRESHOLD` e `CONSECUTIVE_FRAMES_THRESHOLD`.
 ## Stadio 2 (fatto)
 
 - ✅ Tracking di sessione (ByteTrack, ID temporaneo per persona)
-- ✅ Persona a terra (angolo del busto e aspect ratio)
-
 ## Stadio 3 (fatto)
 
 - ✅ Assembramento sospetto: conteggio persone sopra soglia per N secondi
@@ -154,7 +152,6 @@ associato il gesto alla persona più vicina tramite le coordinate).
 
 ## Precisione migliorata
 
-- Caduta: non solo aspect ratio del box, ma angolo del busto (spalle-anche) — più robusto
 - Gesto aiuto: soglie normalizzate sulla diagonale della mano (invariante alla distanza), richiede palmo aperto stabile prima del pugno
 
 ## HUD di stato e Finestra a Schermo Intero
@@ -173,7 +170,7 @@ aiuto. Indicatore REC in alto a destra quando sta registrando una clip.
 
 ## Clip video 5s prima + 5s dopo
 
-Ogni evento rilevante (arma, caduta, fuoco/fumo, segnale aiuto, assembramento)
+Ogni evento rilevante (arma, fuoco/fumo, segnale aiuto, assembramento)
 salva automaticamente una clip `.mp4` con buffer circolare pre-evento e post-evento,
 poi la carica sul backend via HTTP POST a `BACKEND_CLIP_URL`.
 Le clip restano anche salvate in `clips/`.

@@ -17,7 +17,7 @@ CAMERA_FPS = 30
 
 # --- Cadenza inferenze (1 = ogni frame, 2 = un frame sì e uno no, ...) ----
 # Alzare questi valori aumenta gli FPS a scapito della reattività del rilevatore.
-POSE_PROCESS_EVERY = 1     # stima pose/scheletro + caduta
+POSE_PROCESS_EVERY = 1     # stima pose/scheletro
 DETECT_PROCESS_EVERY = 2   # detection oggetti COCO (persone/bastone/coltello)
 WEAPON_PROCESS_EVERY = 2   # detection armi (weapon_threat.rknn), sfalsata di un frame rispetto a COCO
 HANDS_PROCESS_EVERY = 3    # gesto aiuto (MediaPipe, il più costoso su CPU)
@@ -161,7 +161,6 @@ EVENT_COOLDOWN_MAP = {
     "coltello": 10,
     "granata": 10,
     "esplosione": 10,
-    "persona_a_terra": 10,
     "assembramento": 30,
 }
 
@@ -175,9 +174,6 @@ PRESENCE_MIN_FRAMES = 3
 # per tenere accese le luci: deve restare SOTTO la durata di accensione impostata
 # sul backend (setting "presence_light_seconds", default 30s).
 PRESENCE_REPUBLISH_SECONDS = 20
-
-FALL_ASPECT_RATIO = 1.4
-FALL_TORSO_ANGLE_DEG = 55
 
 CROWD_COUNT_THRESHOLD = 5
 CROWD_SECONDS_THRESHOLD = 60
@@ -208,7 +204,7 @@ VIDEO_CLIP_ENABLED = True
 VIDEO_CLIP_PRE_SECONDS = 5          # Buffer 5s prima dell'evento
 VIDEO_CLIP_POST_SECONDS = 5         # Buffer 5s dopo l'evento (3-5s da specifiche)
 VIDEO_CLIP_DIR = "clips"
-VIDEO_CLIP_TRIGGER_TYPES = {"arma", "arma_da_fuoco", "coltello", "granata", "esplosione", "persona_a_terra", "fuoco_fumo", "segnale_aiuto", "assembramento"}
+VIDEO_CLIP_TRIGGER_TYPES = {"arma", "arma_da_fuoco", "coltello", "granata", "esplosione", "fuoco_fumo", "segnale_aiuto", "assembramento"}
 
 VLM_ENABLED = True
 VLM_ENDPOINT = "http://localhost:11434/api/generate"
@@ -221,7 +217,6 @@ VLM_QUESTIONS = {
     "coltello": "Nell'immagine e' visibile un coltello o una lama impugnata o minacciosamente vicino a una persona?",
     "granata": "Nell'immagine e' visibile una granata o un ordigno esplosivo?",
     "esplosione": "Nell'immagine e' visibile un'esplosione reale (fiammata, palla di fuoco, nube di detriti)?",
-    "persona_a_terra": "Nell'immagine c'e' una persona sdraiata o accasciata a terra, come se fosse caduta o ferita?",
     "fuoco_fumo": "Nell'immagine e' visibile fuoco o fumo reale?",
     "assembramento": "Nell'immagine c'e' un gruppo insolitamente numeroso di persone assembrate?",
     "segnale_aiuto": "Nell'immagine una persona sta facendo un gesto con la mano che sembra una richiesta di aiuto?",

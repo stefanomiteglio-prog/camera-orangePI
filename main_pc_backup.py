@@ -14,7 +14,6 @@ from events import (
     verify_handshake,
     upload_snapshot,
 )
-import pose_heuristics as ph
 import hand_gesture as hg
 import hud
 import vlm_confirm
@@ -195,7 +194,7 @@ def main():
                     if consecutive_counts["fuoco_fumo"] >= config.CONSECUTIVE_FRAMES_THRESHOLD:
                         fire_event(now, "fuoco_fumo", confidence, frame, mqtt_client, last_event_time, clip)
 
-            # --- Stadio 2: pose, tracking e caduta ---
+            # --- Stadio 2: pose e tracking ---
             pose_results = pose_model.track(
                 frame, conf=config.CONF_THRESHOLD, device=config.DEVICE,
                 persist=True, verbose=False, tracker="botsort_reid.yaml",
@@ -209,14 +208,6 @@ def main():
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 200, 0), 2)
                     cv2.putText(frame, f"ID {track_id}", (x1, y1 - 8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
-
-                    keypoints = kp.xy[0].tolist()
-                    if ph.is_fallen(xyxy, keypoints):
-                        detected_this_frame.add("persona_a_terra")
-                        consecutive_counts["persona_a_terra"] = consecutive_counts.get("persona_a_terra", 0) + 1
-
-            if "persona_a_terra" in detected_this_frame and consecutive_counts.get("persona_a_terra", 0) >= config.CONSECUTIVE_FRAMES_THRESHOLD:
-                fire_event(now, "persona_a_terra", 1.0, frame, mqtt_client, last_event_time, clip)
 
             for danger_type in list(consecutive_counts.keys()):
                 if danger_type not in detected_this_frame:
@@ -244,7 +235,6 @@ def main():
             # --- HUD di stato (per esposizione) ---
             hud.draw_panel(frame, [
                 ("Persone", False, f"({person_count})"),
-                ("Caduta", "persona_a_terra" in detected_this_frame, ""),
                 ("Assembramento", crowd_start_time is not None, ""),
                 ("Gesto aiuto", gesture_triggered, ""),
             ], recording=clip.is_recording())

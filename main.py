@@ -17,7 +17,6 @@ from events import (
     verify_handshake,
     upload_snapshot,
 )
-import pose_heuristics as ph
 from hand_gesture import HelpGestureDetector
 import hud
 import vlm_confirm
@@ -455,19 +454,16 @@ class CameraPipeline(threading.Thread):
                 if self.consecutive_counts[danger_type] >= config.CONSECUTIVE_FRAMES_THRESHOLD:
                     self._fire_event(now, danger_type, confidence, raw_frame)
 
-            # --- Analisi Pose e Caduta ---
+            # --- Analisi Pose ---
             tracked = self.tracker.update(pose_results)
 
             for det in tracked:
                 track_id = det["track_id"]
                 x1, y1, x2, y2 = map(int, det["box"])
-                xyxy = det["box"]
                 cv2.rectangle(display_frame, (x1, y1), (x2, y2), (255, 200, 0), 2)
                 cv2.putText(display_frame, f"ID {track_id}", (x1, y1 - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
 
-                keypoints = [(kp[0], kp[1]) for kp in det["keypoints"]]
-                kconf = [kp[2] for kp in det["keypoints"]]
                 for kx, ky, kc in det["keypoints"]:
                     if kc > 0.5:
                         cv2.circle(display_frame, (int(kx), int(ky)), 3, (0, 0, 255), -1)
@@ -477,14 +473,6 @@ class CameraPipeline(threading.Thread):
                     p2 = det["keypoints"][sk[1] - 1]
                     if p1[2] > 0.5 and p2[2] > 0.5:
                         cv2.line(display_frame, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), (255, 128, 0), 2)
-
-                if ph.is_fallen(xyxy, keypoints, kconf):
-                    detected_this_frame.add("persona_a_terra")
-                    self.consecutive_counts["persona_a_terra"] = self.consecutive_counts.get("persona_a_terra", 0) + 1
-
-            # Innesco allarme caduta validato
-            if "persona_a_terra" in detected_this_frame and self.consecutive_counts.get("persona_a_terra", 0) >= config.CONSECUTIVE_FRAMES_THRESHOLD:
-                self._fire_event(now, "persona_a_terra", 1.0, raw_frame)
 
             # Reset contatori per pericoli non più visibili nel frame corrente
             for danger_type in list(self.consecutive_counts.keys()):
@@ -528,7 +516,6 @@ class CameraPipeline(threading.Thread):
             hud.draw_panel(display_frame, [
                 ("Persone", False, f"({person_count})"),
                 ("Arma", bool(dangers), f"({', '.join(dangers)})" if dangers else ""),
-                ("Caduta", "persona_a_terra" in detected_this_frame, ""),
                 ("Assembramento", self.crowd_start_time is not None, ""),
                 ("Gesto aiuto", gesture_triggered, ""),
             ], recording=self.clip.is_recording())
