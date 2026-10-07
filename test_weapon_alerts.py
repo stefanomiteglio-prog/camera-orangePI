@@ -1,7 +1,7 @@
 """
 Test locale dei nuovi allarmi del modello armi (weapon_threat.rknn) SENZA
 telecamera e SENZA NPU: simula ciò che main.py invia al backend quando rileva
-una delle classi segnalate (grenade, knife).
+una delle 4 classi (Gun, explosion, grenade, knife).
 
 Per ogni classe:
   1. carica uno snapshot JPG finto      (POST /api/vision/snapshot)
@@ -13,8 +13,8 @@ sovrascritti solo in memoria, config.py e gli altri programmi restano invariati.
 
 Uso:
     pip install paho-mqtt requests
-    python test_weapon_alerts.py                       # tutte le classi
-    python test_weapon_alerts.py --class knife         # una sola classe
+    python test_weapon_alerts.py                       # tutte e 4 le classi
+    python test_weapon_alerts.py --class Gun           # una sola classe
     python test_weapon_alerts.py --device mini_cam_02  # altra telecamera censita (Zona B)
     python test_weapon_alerts.py --image foto.jpg      # snapshot reale al posto di quello finto
 """
@@ -85,7 +85,7 @@ def main():
                         help="device_id/MAC di una telecamera censita nel backend (default: %(default)s)")
     parser.add_argument("--class", dest="classes", action="append", choices=list(class_map),
                         help="classe da simulare (ripetibile). Default: tutte")
-    parser.add_argument("--confidence", type=float, default=0.87)
+    parser.add_argument("--confidence", type=float, default=0.95)
     parser.add_argument("--interval", type=float, default=2.0, help="secondi tra un allarme e il successivo")
     parser.add_argument("--image", help="JPG da usare come snapshot al posto di quello generato")
     args = parser.parse_args()
@@ -160,7 +160,7 @@ def main():
               f"| MQTT: {'OK' if sent else 'FALLITO'} | {backend}")
     print("===========================================")
     print("Apri la webapp (http://localhost:5173): le pratiche di sicurezza devono mostrare\n"
-          "i nuovi eventi con etichetta 'Coltello rilevato' e 'Granata rilevata'.")
+          "i nuovi eventi con etichetta 'Arma da fuoco rilevata', 'Esplosione rilevata', ecc.")
     return 0 if all_ok else 1
 
 

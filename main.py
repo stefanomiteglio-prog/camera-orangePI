@@ -28,6 +28,7 @@ POSE_RKNN_PATH = getattr(config, "POSE_RKNN_PATH", "yolov8s-pose.rknn")
 DETECT_RKNN_PATH = getattr(config, "DETECT_RKNN_PATH", "rknn_test/rknn_model_zoo/examples/yolov8/model/yolov8n.rknn")
 WEAPON_RKNN_PATH = getattr(config, "WEAPON_RKNN_PATH", "weapon_threat.rknn")
 WEAPON_CLASS_MAP = getattr(config, "WEAPON_CLASS_MAP", {})
+WEAPON_CLASS_MIN_CONF = getattr(config, "WEAPON_CLASS_MIN_CONF", {})
 RKNN_TARGET = getattr(config, "RKNN_TARGET", "rk3588")
 
 
@@ -260,7 +261,7 @@ class CameraPipeline(threading.Thread):
         self.detect_model = DetectModel(DETECT_RKNN_PATH, core_mask=RKNNLite.NPU_CORE_AUTO, conf_thresh=config.CONF_THRESHOLD)
         self.pose_model = PoseModel(POSE_RKNN_PATH, core_mask=RKNNLite.NPU_CORE_AUTO, conf_thresh=config.CONF_THRESHOLD)
 
-        # Modello armi dedicato (grenade/knife; "Gun" ed "explosion" ignorate). Opzionale: se il
+        # Modello armi dedicato (Gun/explosion/grenade/knife). Opzionale: se il
         # file .rknn manca la pipeline prosegue con i soli modelli COCO/pose.
         self.weapon_model = None
         if getattr(config, "WEAPON_ENABLED", True):
@@ -441,7 +442,7 @@ class CameraPipeline(threading.Thread):
                     danger_dets.append((config.DANGER_CLASS_MAP[class_name], class_name, det))
             for det in self.last_weapons:
                 class_name = det["class_name"]
-                if class_name in WEAPON_CLASS_MAP:
+                if class_name in WEAPON_CLASS_MAP and det["score"] > WEAPON_CLASS_MIN_CONF.get(class_name, 0.0):
                     danger_dets.append((WEAPON_CLASS_MAP[class_name], class_name, det))
 
             for danger_type, class_name, det in danger_dets:
