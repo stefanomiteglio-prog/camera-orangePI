@@ -260,7 +260,7 @@ class CameraPipeline(threading.Thread):
         self.detect_model = DetectModel(DETECT_RKNN_PATH, core_mask=RKNNLite.NPU_CORE_AUTO, conf_thresh=config.CONF_THRESHOLD)
         self.pose_model = PoseModel(POSE_RKNN_PATH, core_mask=RKNNLite.NPU_CORE_AUTO, conf_thresh=config.CONF_THRESHOLD)
 
-        # Modello armi dedicato (Gun/explosion/grenade/knife). Opzionale: se il
+        # Modello armi dedicato (explosion/grenade/knife; "Gun" ignorata). Opzionale: se il
         # file .rknn manca la pipeline prosegue con i soli modelli COCO/pose.
         self.weapon_model = None
         if getattr(config, "WEAPON_ENABLED", True):
