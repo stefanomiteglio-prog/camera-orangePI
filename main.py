@@ -286,7 +286,9 @@ class CameraPipeline(threading.Thread):
         self.weapon_every = max(1, getattr(config, "WEAPON_PROCESS_EVERY", 2))
         self.hands_every = max(1, getattr(config, "HANDS_PROCESS_EVERY", 3))
 
-        self.consecutive_counts = {}
+        # Conferma a tempo delle armi: danger_type -> istante di primo/ultimo avvistamento
+        self.danger_first_seen = {}
+        self.danger_last_seen = {}
         self.last_event_time = {}
         self.crowd_start_time = None
         self.presence_frames = 0
@@ -306,7 +308,8 @@ class CameraPipeline(threading.Thread):
 
     def reset(self):
         self.last_event_time.clear()
-        self.consecutive_counts.clear()
+        self.danger_first_seen.clear()
+        self.danger_last_seen.clear()
         self.crowd_start_time = None
         logger.info(f"[{self.zone}] Reset manuale cooldown/contatori.")
 
@@ -353,7 +356,8 @@ class CameraPipeline(threading.Thread):
         logger.warning(f"[{self.zone}] Nessun segnale video: pipeline in attesa della telecamera.")
         with self.display_lock:
             self.latest_display = None
-        self.consecutive_counts.clear()
+        self.danger_first_seen.clear()
+        self.danger_last_seen.clear()
         self.crowd_start_time = None
         self.presence_frames = 0
         self.last_detections = []
@@ -448,10 +452,24 @@ class CameraPipeline(threading.Thread):
                 cv2.putText(display_frame, f"{class_name} {confidence:.2f}", (x1, max(20, y1 - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
+            # L'arma deve restare visibile per DANGER_CONFIRM_SECONDS prima di
+            # segnalare: un riconoscimento isolato non basta (falsi positivi).
+            # Buchi più brevi di DANGER_CONFIRM_GAP_SECONDS non azzerano il conteggio.
+            gap = getattr(config, "DANGER_CONFIRM_GAP_SECONDS", 0.5)
+            for danger_type in list(self.danger_first_seen.keys()):
+                if danger_type not in dangers and now - self.danger_last_seen[danger_type] > gap:
+                    del self.danger_first_seen[danger_type]
+                    del self.danger_last_seen[danger_type]
+
+            danger_held = {}
             for danger_type, confidence in dangers.items():
                 detected_this_frame.add(danger_type)
-                self.consecutive_counts[danger_type] = self.consecutive_counts.get(danger_type, 0) + 1
-                if self.consecutive_counts[danger_type] >= config.CONSECUTIVE_FRAMES_THRESHOLD:
+                self.danger_last_seen[danger_type] = now
+                held = now - self.danger_first_seen.setdefault(danger_type, now)
+                danger_held[danger_type] = held
+                confirm = getattr(config, "DANGER_CONFIRM_SECONDS_MAP", {}).get(
+                    danger_type, getattr(config, "DANGER_CONFIRM_SECONDS", 3.0))
+                if held >= confirm:
                     self._fire_event(now, danger_type, confidence, raw_frame)
 
             # --- Analisi Pose ---
@@ -473,11 +491,6 @@ class CameraPipeline(threading.Thread):
                     p2 = det["keypoints"][sk[1] - 1]
                     if p1[2] > 0.5 and p2[2] > 0.5:
                         cv2.line(display_frame, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), (255, 128, 0), 2)
-
-            # Reset contatori per pericoli non più visibili nel frame corrente
-            for danger_type in list(self.consecutive_counts.keys()):
-                if danger_type not in detected_this_frame:
-                    self.consecutive_counts[danger_type] = 0
 
             # --- Presenza (accensione luci di zona) ---
             # Persona vista dal detector COCO oppure dal modello pose: basta uno dei due.
@@ -515,7 +528,7 @@ class CameraPipeline(threading.Thread):
             hud.draw_progress_bar(display_frame, "Gesto aiuto", self.gesture.progress())
             hud.draw_panel(display_frame, [
                 ("Persone", False, f"({person_count})"),
-                ("Arma", bool(dangers), f"({', '.join(dangers)})" if dangers else ""),
+                ("Arma", bool(dangers), "(" + ", ".join(f"{t} {s:.1f}s" for t, s in danger_held.items()) + ")" if dangers else ""),
                 ("Assembramento", self.crowd_start_time is not None, ""),
                 ("Gesto aiuto", gesture_triggered, ""),
             ], recording=self.clip.is_recording())

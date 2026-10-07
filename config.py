@@ -151,7 +151,18 @@ DANGER_CLASS_MAP = {
 
 # Numero di frame consecutivi in cui il pericolo deve essere rilevato
 # prima di generare un evento, per ridurre i falsi positivi.
-CONSECUTIVE_FRAMES_THRESHOLD = 5
+CONSECUTIVE_FRAMES_THRESHOLD = 5   # usato solo da main_pc_backup.py
+
+# Conferma a tempo delle armi (main.py): l'arma deve restare visibile per questi
+# secondi prima di inviare la segnalazione. Indipendente dagli FPS.
+DANGER_CONFIRM_SECONDS = 3.0
+# Eccezioni per alert_type: un'esplosione non dura 3 secondi.
+DANGER_CONFIRM_SECONDS_MAP = {
+    "esplosione": 0.5,
+}
+# Il detector "sfarfalla": buchi più brevi di questa durata non azzerano il
+# conteggio dei secondi. Oltre, l'arma è considerata sparita e si riparte da zero.
+DANGER_CONFIRM_GAP_SECONDS = 0.5
 
 EVENT_COOLDOWN_SECONDS = 5
 EVENT_COOLDOWN_MAP = {
