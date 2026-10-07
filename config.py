@@ -112,9 +112,8 @@ WEAPON_CLASSES = ["Gun", "explosion", "grenade", "knife"]
 # positivi a bassa confidenza (nel test a 0.10 riconosce "qualsiasi oggetto").
 WEAPON_CONF_THRESHOLD = 0.35
 # Classe del modello -> alert_type inviato al backend. Le classi non elencate
-# qui ("Gun") vengono ignorate: nessun riquadro e nessuna segnalazione.
+# qui ("Gun", "explosion") vengono ignorate: nessun riquadro e nessuna segnalazione.
 WEAPON_CLASS_MAP = {
-    "explosion": "esplosione",
     "grenade": "granata",
     "knife": "coltello",
 }
@@ -153,7 +152,7 @@ DANGER_CLASS_MAP = {
 # prima di generare un evento, per ridurre i falsi positivi.
 CONSECUTIVE_FRAMES_THRESHOLD = 5   # usato solo da main_pc_backup.py
 
-# Conferma a tempo (main.py): arma, coltello, granata ed esplosione
+# Conferma a tempo (main.py): arma, coltello e granata
 # devono restare visibili per questi secondi prima di inviare la segnalazione.
 # Indipendente dagli FPS.
 DANGER_CONFIRM_SECONDS = 3.0
@@ -167,7 +166,6 @@ EVENT_COOLDOWN_MAP = {
     "arma": 10,
     "coltello": 10,
     "granata": 10,
-    "esplosione": 10,
     "assembramento": 30,
 }
 
@@ -211,7 +209,7 @@ VIDEO_CLIP_ENABLED = True
 VIDEO_CLIP_PRE_SECONDS = 5          # Buffer 5s prima dell'evento
 VIDEO_CLIP_POST_SECONDS = 5         # Buffer 5s dopo l'evento (3-5s da specifiche)
 VIDEO_CLIP_DIR = "clips"
-VIDEO_CLIP_TRIGGER_TYPES = {"arma", "coltello", "granata", "esplosione", "fuoco_fumo", "segnale_aiuto", "assembramento"}
+VIDEO_CLIP_TRIGGER_TYPES = {"arma", "coltello", "granata", "fuoco_fumo", "segnale_aiuto", "assembramento"}
 
 VLM_ENABLED = True
 VLM_ENDPOINT = "http://localhost:11434/api/generate"
@@ -222,7 +220,6 @@ VLM_QUESTIONS = {
     "arma": "Nell'immagine e' visibile un'arma (coltello, bastone, oggetto usato come arma) impugnata o minacciosamente vicino a una persona?",
     "coltello": "Nell'immagine e' visibile un coltello o una lama impugnata o minacciosamente vicino a una persona?",
     "granata": "Nell'immagine e' visibile una granata o un ordigno esplosivo?",
-    "esplosione": "Nell'immagine e' visibile un'esplosione reale (fiammata, palla di fuoco, nube di detriti)?",
     "fuoco_fumo": "Nell'immagine e' visibile fuoco o fumo reale?",
     "assembramento": "Nell'immagine c'e' un gruppo insolitamente numeroso di persone assembrate?",
     "segnale_aiuto": "Nell'immagine una persona sta facendo un gesto con la mano che sembra una richiesta di aiuto?",

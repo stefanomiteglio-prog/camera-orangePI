@@ -1,7 +1,7 @@
 """
 Test locale dei nuovi allarmi del modello armi (weapon_threat.rknn) SENZA
 telecamera e SENZA NPU: simula ciò che main.py invia al backend quando rileva
-una delle classi segnalate (explosion, grenade, knife).
+una delle classi segnalate (grenade, knife).
 
 Per ogni classe:
   1. carica uno snapshot JPG finto      (POST /api/vision/snapshot)
@@ -160,7 +160,7 @@ def main():
               f"| MQTT: {'OK' if sent else 'FALLITO'} | {backend}")
     print("===========================================")
     print("Apri la webapp (http://localhost:5173): le pratiche di sicurezza devono mostrare\n"
-          "i nuovi eventi con etichetta 'Coltello rilevato', 'Esplosione rilevata', ecc.")
+          "i nuovi eventi con etichetta 'Coltello rilevato' e 'Granata rilevata'.")
     return 0 if all_ok else 1
 
 
