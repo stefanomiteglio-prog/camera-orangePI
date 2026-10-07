@@ -455,6 +455,7 @@ class CameraPipeline(threading.Thread):
             # L'arma deve restare visibile per DANGER_CONFIRM_SECONDS prima di
             # segnalare: un riconoscimento isolato non basta (falsi positivi).
             # Buchi più brevi di DANGER_CONFIRM_GAP_SECONDS non azzerano il conteggio.
+            confirm = getattr(config, "DANGER_CONFIRM_SECONDS", 3.0)
             gap = getattr(config, "DANGER_CONFIRM_GAP_SECONDS", 0.5)
             for danger_type in list(self.danger_first_seen.keys()):
                 if danger_type not in dangers and now - self.danger_last_seen[danger_type] > gap:
@@ -467,8 +468,6 @@ class CameraPipeline(threading.Thread):
                 self.danger_last_seen[danger_type] = now
                 held = now - self.danger_first_seen.setdefault(danger_type, now)
                 danger_held[danger_type] = held
-                confirm = getattr(config, "DANGER_CONFIRM_SECONDS_MAP", {}).get(
-                    danger_type, getattr(config, "DANGER_CONFIRM_SECONDS", 3.0))
                 if held >= confirm:
                     self._fire_event(now, danger_type, confidence, raw_frame)
 
