@@ -136,13 +136,6 @@ WEAPON_CLASS_MAP = {
     "grenade": "granata",
     "knife": "coltello",
 }
-# Confidenza minima per singola classe (deve essere SUPERIORE al valore): sotto
-# soglia la rilevazione viene ignorata, nessun riquadro e nessuna segnalazione.
-# Le classi non elencate usano solo WEAPON_CONF_THRESHOLD.
-WEAPON_CLASS_MIN_CONF = {
-    "Gun": 0.90,
-    "explosion": 0.90,
-}
 
 # Modelli PyTorch (usati nel test locale o fallback PC)
 YOLO_WEIGHTS = "yolov8s.pt"
@@ -163,6 +156,12 @@ STORAGE_CLEANUP_INTERVAL_SECONDS = 1800  # ogni 30 minuti
 
 # Confidence minima per considerare valida una rilevazione
 CONF_THRESHOLD = 0.3
+
+# Confidenza minima di OGNI segnalazione (deve essere SUPERIORE al valore).
+# Vale per tutte le classi di pericolo (COCO, modello armi, fuoco/fumo): sotto
+# soglia la rilevazione viene ignorata, nessun riquadro e nessuna segnalazione.
+# events.publish_event scarta comunque qualsiasi allarme sotto soglia.
+ALERT_MIN_CONF = 0.90
 
 # Classi COCO gia' presenti nel modello pre-addestrato che ci interessano.
 # COCO include gia' "knife" (coltello) e "baseball bat" (bastone) di serie.

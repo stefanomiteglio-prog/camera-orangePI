@@ -171,7 +171,7 @@ def main():
                 confidence = float(box.conf[0])
                 if class_name == "person":
                     person_count += 1
-                if class_name in config.DANGER_CLASS_MAP:
+                if class_name in config.DANGER_CLASS_MAP and confidence > config.ALERT_MIN_CONF:
                     danger_type = config.DANGER_CLASS_MAP[class_name]
                     detected_this_frame.add(danger_type)
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -187,6 +187,8 @@ def main():
                 fr = fire_model.predict(frame, conf=config.CONF_THRESHOLD, device=config.DEVICE, verbose=False)[0]
                 for box in fr.boxes:
                     confidence = float(box.conf[0])
+                    if confidence <= config.ALERT_MIN_CONF:
+                        continue
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 140, 255), 2)
                     detected_this_frame.add("fuoco_fumo")
