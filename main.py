@@ -13,8 +13,8 @@ from events import (
     publish_event,
     publish_presence,
     start_heartbeat,
+    start_handshake_retry,
     notify_telegram,
-    verify_handshake,
     upload_snapshot,
 )
 from hand_gesture import HelpGestureDetector
@@ -90,6 +90,50 @@ def _process_event_async(device_id, zone, danger_type, confidence, snapshot_path
     notify_telegram(f"⚠️ TreeEyes [{zone}] - {label} (Camera: {device_id})")
 
 
+# --- Assegnazione automatica telecamere ("camera_index": "auto") ----------
+# Una zona "auto" prende la prima telecamera USB libera in /dev/v4l/by-id,
+# di qualunque modello. Le zone "auto" vengono servite nell'ordine di
+# config.CAMERAS: una zona non prende una telecamera finché quelle prima di
+# lei ne sono senza, così con una sola telecamera si accende sempre la prima.
+# I path scritti esplicitamente in config non vengono mai assegnati in automatico.
+V4L_BY_ID_DIR = "/dev/v4l/by-id"
+_auto_lock = threading.Lock()
+_auto_zones = []        # zone "auto" in ordine di priorità
+_auto_claims = {}       # path telecamera -> zona che la sta usando
+_fixed_sources = set()  # path espliciti in config
+
+
+def init_auto_cameras(cameras):
+    _auto_zones[:] = [c.get("zone", c["device_id"]) for c in cameras if c["camera_index"] == "auto"]
+    _fixed_sources.clear()
+    _fixed_sources.update(c["camera_index"] for c in cameras if c["camera_index"] != "auto")
+
+
+def _claim_auto_camera(zone):
+    with _auto_lock:
+        for z in _auto_zones:
+            if z == zone:
+                break
+            if z not in _auto_claims.values():
+                return None
+        try:
+            names = sorted(os.listdir(V4L_BY_ID_DIR))
+        except OSError:
+            names = []
+        # Solo il nodo di cattura (index0): index1 è il nodo metadati UVC
+        for name in names:
+            path = os.path.join(V4L_BY_ID_DIR, name)
+            if name.endswith("-video-index0") and path not in _fixed_sources and path not in _auto_claims:
+                _auto_claims[path] = zone
+                return path
+    return None
+
+
+def _release_auto_camera(path):
+    with _auto_lock:
+        _auto_claims.pop(path, None)
+
+
 def open_capture(cam_cfg):
     source = cam_cfg["camera_index"]
     # Path V4L2 assente = telecamera scollegata: inutile tentare l'apertura
@@ -145,12 +189,23 @@ class VideoCaptureThread:
         # True mentre la telecamera è assente: evita di ripetere lo stesso log
         # a ogni tentativo di riconnessione (uno al secondo).
         self.waiting = False
+        # Sorgente effettivamente aperta (per "auto" il path assegnato)
+        self.source = None
+        self.auto = cam_cfg["camera_index"] == "auto"
+        self.last_frame_time = 0.0
         self._init_cap()
 
     def _init_cap(self):
         zone = self.cam_cfg.get("zone", "?")
+        cfg = self.cam_cfg
         try:
-            self.cap = open_capture(self.cam_cfg)
+            if self.auto:
+                path = _claim_auto_camera(zone)
+                if path is None:
+                    raise RuntimeError(f"nessuna telecamera libera in {V4L_BY_ID_DIR}")
+                cfg = dict(cfg, camera_index=path)
+            self.source = cfg["camera_index"]
+            self.cap = open_capture(cfg)
             self.consecutive_failures = 0
             if self.waiting:
                 logger.info(f"[{zone}] Telecamera ricollegata.")
@@ -160,6 +215,12 @@ class VideoCaptureThread:
                 logger.error(f"[{zone}] Telecamera non disponibile ({e}): in attesa che venga collegata...")
             self.waiting = True
             self.cap = None
+            self._release_source()
+
+    def _release_source(self):
+        if self.auto and self.source is not None:
+            _release_auto_camera(self.source)
+            self.source = None
 
     def _drop_cap(self):
         """Rilascia la capture e scarta l'ultimo frame (telecamera persa)."""
@@ -169,13 +230,18 @@ class VideoCaptureThread:
             except Exception:
                 pass
         self.cap = None
+        self._release_source()
         with self.lock:
             self.frame = None
         self.new_frame_event.clear()
 
     def _device_missing(self):
-        source = self.cam_cfg["camera_index"]
+        source = self.source
         return isinstance(source, str) and source.startswith("/dev/") and not os.path.exists(source)
+
+    def has_signal(self, max_age=3.0):
+        """True se la telecamera ha mandato un frame negli ultimi max_age secondi."""
+        return time.time() - self.last_frame_time < max_age
 
     def start(self):
         self.running = True
@@ -211,6 +277,7 @@ class VideoCaptureThread:
                 continue
 
             self.consecutive_failures = 0
+            self.last_frame_time = time.time()
             with self.lock:
                 self.frame = frame
             self.new_frame_event.set()
@@ -232,6 +299,7 @@ class VideoCaptureThread:
                 self.cap.release()
             except Exception:
                 pass
+        self._release_source()
 
 
 class CameraPipeline(threading.Thread):
@@ -344,6 +412,10 @@ class CameraPipeline(threading.Thread):
 
     def stop(self):
         self.running = False
+
+    def camera_online(self):
+        """True se la telecamera della zona sta mandando frame."""
+        return self.capture is not None and self.capture.has_signal()
 
     def _on_signal_lost(self):
         """
@@ -577,11 +649,14 @@ def compose_grid(pipelines, target_h=720):
     Compone i display delle telecamere affiancati orizzontalmente,
     normalizzando all'altezza target e separandoli con una sottile linea.
     """
+    # Solo le zone con segnale: con una telecamera sola si vede a tutto schermo.
+    # Se nessuna ha segnale, un riquadro di attesa per ogni zona.
+    frames = [f for f in (p.get_display() for p in pipelines) if f is not None]
+    if not frames:
+        frames = [_placeholder(p.zone) for p in pipelines]
+
     tiles = []
-    for p in pipelines:
-        frame = p.get_display()
-        if frame is None:
-            frame = _placeholder(p.zone)
+    for frame in frames:
         h, w = frame.shape[:2]
         if h != target_h:
             scale = target_h / h
@@ -603,15 +678,11 @@ def main():
     if not cameras:
         raise RuntimeError("Nessuna telecamera definita in config.CAMERAS")
 
-    # 1. Handshake di autenticazione per OGNI telecamera
-    for cam in cameras:
-        verify_handshake(cam["device_id"])
+    init_auto_cameras(cameras)
 
-    # 2. Connessione broker MQTT (una connessione condivisa)
-    mqtt_client = build_mqtt_client()
-
-    # 3. Avvio Heartbeat periodico per OGNI telecamera (ognuna sul proprio topic)
-    heartbeat_services = [start_heartbeat(mqtt_client, device_id=cam["device_id"]) for cam in cameras]
+    # 1. Connessione broker MQTT (una connessione condivisa). Se il broker non
+    #    è ancora raggiungibile (rete non pronta all'accensione) si ritenta in background.
+    mqtt_client = build_mqtt_client(retry=True)
 
     os.makedirs("snapshots", exist_ok=True)
     os.makedirs(getattr(config, "VIDEO_CLIP_DIR", "clips"), exist_ok=True)
@@ -621,10 +692,19 @@ def main():
     cleanup_old_files(getattr(config, "VIDEO_CLIP_DIR", "clips"), getattr(config, "MAX_CLIPS_COUNT", 100))
     last_cleanup_time = time.time()
 
-    # 4. Avvio pipeline (una per telecamera, con modelli NPU dedicati)
+    # 2. Avvio pipeline (una per telecamera, con modelli NPU dedicati)
     pipelines = [CameraPipeline(cam, mqtt_client) for cam in cameras]
     for p in pipelines:
         p.start()
+
+    # 3. Handshake e heartbeat per zona, attivi solo mentre la sua telecamera
+    #    manda frame: il backend vede online solo le zone che funzionano davvero.
+    stop_event = threading.Event()
+    for p in pipelines:
+        start_handshake_retry(p.device_id, stop_event, ready=p.camera_online)
+    heartbeat_services = [
+        start_heartbeat(mqtt_client, device_id=p.device_id, is_active=p.camera_online) for p in pipelines
+    ]
 
     window_name = getattr(config, "WINDOW_NAME", "TreeEyes - Vision Node")
     is_fullscreen = getattr(config, "WINDOW_FULLSCREEN", True)
@@ -685,6 +765,7 @@ def main():
                 time.sleep(0.05)
 
     finally:
+        stop_event.set()
         for p in pipelines:
             p.stop()
         for p in pipelines:

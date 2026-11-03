@@ -3,7 +3,7 @@ import json
 import time
 import threading
 from datetime import datetime, timezone
-from typing import Optional, Union, Any
+from typing import Optional, Union, Any, Callable
 
 try:
     import cv2
@@ -26,6 +26,21 @@ def verify_handshake(device_id: Optional[str] = None, backend_url: Optional[str]
 
     Endpoint: GET /devices/me (oppure GET /api/vision/me)
     Header: X-MAC-Address: <TUO_MAC_ADDRESS>
+    """
+    result, last_error = _try_handshake(device_id, backend_url)
+    if result is None:
+        logger.warning(
+            f"Handshake backend non completato ({last_error}). "
+            f"Il sistema continuerà in modalità autonoma."
+        )
+    return result is True
+
+
+def _try_handshake(device_id: Optional[str] = None, backend_url: Optional[str] = None):
+    """
+    Un tentativo di handshake. Ritorna (esito, ultimo_errore):
+    True = autorizzata, False = rifiutata dal backend (401/403, inutile
+    ritentare), None = backend non raggiungibile o risposta inattesa.
     """
     mac = device_id or config.DEVICE_ID
     base_url = backend_url or getattr(config, "BACKEND_HTTP_URL", f"http://{config.BACKEND_HTTP_HOST}:{config.BACKEND_HTTP_PORT}")
@@ -54,19 +69,19 @@ def verify_handshake(device_id: Optional[str] = None, backend_url: Optional[str]
                     f"Handshake backend RIUSCITO ({url}): "
                     f"Telecamera '{mac}' autorizzata per zona '{zone}' (status={status}, tipo={dev_type})"
                 )
-                return True
+                return True, None
             elif resp.status_code == 401:
                 logger.error(
                     f"Handshake fallito (HTTP 401 Unauthorized): "
                     f"Il MAC address '{mac}' non è censito nel database del backend!"
                 )
-                return False
+                return False, None
             elif resp.status_code == 403:
                 logger.error(
                     f"Handshake fallito (HTTP 403 Forbidden): "
                     f"Il dispositivo '{mac}' esiste ma non è configurato come 'camera'!"
                 )
-                return False
+                return False, None
             elif resp.status_code in (404, 405):
                 # Endpoint non trovato su questa rotta, prova il prossimo
                 continue
@@ -76,12 +91,46 @@ def verify_handshake(device_id: Optional[str] = None, backend_url: Optional[str]
             last_error = str(e)
             break
 
-    if last_error:
-        logger.warning(
-            f"Handshake backend non completato ({last_error}). "
-            f"Il sistema continuerà in modalità autonoma."
-        )
-    return False
+    return None, last_error or "nessun endpoint di handshake trovato (HTTP 404/405)"
+
+
+def start_handshake_retry(
+    device_id: str,
+    stop_event: threading.Event,
+    ready: Optional[Callable[[], bool]] = None,
+    interval: Optional[float] = None,
+) -> threading.Thread:
+    """
+    Handshake in background, ritentato finché il backend non risponde.
+
+    All'accensione la rete può non essere ancora pronta quando parte main.py:
+    un solo tentativo lascerebbe la telecamera non annunciata fino al riavvio.
+    Con 'ready' l'handshake parte solo quando la telecamera manda frame, così
+    una zona senza telecamera non si annuncia al backend.
+    Si ferma al primo esito definitivo (autorizzata o rifiutata) o a stop_event.
+    """
+    interval = float(interval if interval is not None else getattr(config, "HANDSHAKE_RETRY_SECONDS", 30))
+
+    def _run():
+        warned = False
+        while not stop_event.is_set():
+            if ready is not None and not ready():
+                stop_event.wait(1.0)
+                continue
+            result, last_error = _try_handshake(device_id)
+            if result is not None:
+                return
+            if not warned:
+                logger.warning(
+                    f"Handshake backend non completato per '{device_id}' ({last_error}). "
+                    f"Nuovo tentativo ogni {interval:.0f}s, nel frattempo il sistema lavora in autonomia."
+                )
+                warned = True
+            stop_event.wait(interval)
+
+    thread = threading.Thread(target=_run, name=f"Handshake-{device_id}", daemon=True)
+    thread.start()
+    return thread
 
 
 def upload_snapshot(frame_or_path: Any, device_id: Optional[str] = None) -> Optional[str]:
@@ -184,7 +233,7 @@ def upload_video_clip(clip_path: str, reason: str = "alert", device_id: Optional
 # MQTT
 # ============================================================
 
-def build_mqtt_client(client_id: Optional[str] = None):
+def build_mqtt_client(client_id: Optional[str] = None, retry: bool = False):
     """
     Crea e connette il client MQTT della Vision Node.
 
@@ -193,6 +242,10 @@ def build_mqtt_client(client_id: Optional[str] = None):
     NON è più il device_id di una singola telecamera, ma un identificativo unico
     del nodo (config.MQTT_CLIENT_ID), evitando che due connessioni con lo stesso
     client_id si sconnettano a vicenda.
+
+    Con retry=True, se il broker non è raggiungibile il client viene restituito
+    comunque e paho ritenta la connessione in background (es. rete non ancora
+    pronta all'accensione). Con retry=False (script di test) ritorna None.
     """
     if not getattr(config, "MQTT_ENABLED", True):
         logger.warning("MQTT disabilitato in config.py (modalità offline).")
@@ -221,6 +274,10 @@ def build_mqtt_client(client_id: Optional[str] = None):
             mqtt_password,
         )
 
+    if retry:
+        client.reconnect_delay_set(min_delay=1, max_delay=30)
+        _log_mqtt_connection_state(client, cid)
+
     try:
         client.connect(
             config.MQTT_BROKER_HOST,
@@ -229,17 +286,49 @@ def build_mqtt_client(client_id: Optional[str] = None):
         )
         client.loop_start()
 
-        logger.info(
-            f"MQTT connesso a {config.MQTT_BROKER_HOST}:{config.MQTT_BROKER_PORT} (client_id={cid})"
-        )
+        if not retry:
+            logger.info(
+                f"MQTT connesso a {config.MQTT_BROKER_HOST}:{config.MQTT_BROKER_PORT} (client_id={cid})"
+            )
         return client
 
     except Exception as e:
+        if not retry:
+            logger.warning(
+                f"Errore connessione MQTT ({e}): broker non raggiungibile. "
+                f"Il sistema continuerà in locale senza MQTT."
+            )
+            return None
+
+        # connect() ha già memorizzato host/porta: il thread di loop_start()
+        # ritenta da solo (retry_first_connection) con attesa crescente.
+        client.loop_start()
         logger.warning(
             f"Errore connessione MQTT ({e}): broker non raggiungibile. "
-            f"Il sistema continuerà in locale senza MQTT."
+            f"Nuovi tentativi in background, nel frattempo il sistema lavora in locale."
         )
-        return None
+        return client
+
+
+def _log_mqtt_connection_state(client, cid):
+    """Logga connessione/disconnessione del broker (firme callback paho v1 e v2)."""
+    def on_connect(_client, _userdata, _flags, reason_code, *args):
+        if reason_code == 0:
+            logger.info(
+                f"MQTT connesso a {config.MQTT_BROKER_HOST}:{config.MQTT_BROKER_PORT} (client_id={cid})"
+            )
+        else:
+            logger.warning(f"Connessione MQTT rifiutata dal broker: {reason_code}")
+
+    def on_disconnect(_client, _userdata, *args):
+        logger.warning("MQTT disconnesso dal broker: nuovi tentativi in background.")
+
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+
+
+def _mqtt_connected(mqtt_client) -> bool:
+    return mqtt_client is not None and mqtt_client.is_connected()
 
 
 # ============================================================
@@ -304,6 +393,12 @@ def publish_event(
             qos=1,
         )
 
+        # Broker momentaneamente irraggiungibile: con QoS 1 paho tiene il
+        # messaggio in coda e lo invia alla riconnessione.
+        if result.rc == mqtt.MQTT_ERR_NO_CONN:
+            logger.warning(f"MQTT non connesso: allarme {danger_type} ({dev}) in coda, partirà alla riconnessione.")
+            return False
+
         if result.rc != mqtt.MQTT_ERR_SUCCESS:
             logger.error(f"Errore pubblicazione MQTT su {topic} (rc={result.rc})")
             return False
@@ -353,7 +448,9 @@ def publish_presence(mqtt_client, person_count: int = 1, device_id: Optional[str
         "sampling_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
-    if mqtt_client is None:
+    # Presenza e heartbeat descrivono lo stato attuale: inutile accodarli per
+    # inviarli in ritardo alla riconnessione.
+    if not _mqtt_connected(mqtt_client):
         logger.debug(f"MQTT offline: presenza ({dev}) non inviata al broker.")
         return False
 
@@ -426,6 +523,10 @@ class HeartbeatService:
     """
     Gestore thread in background per l'invio del battito cardiaco (heartbeat) periodico.
     Evita che la telecamera venga considerata offline dal backend TreeEyes in assenza di allarmi.
+
+    is_active (opzionale) dice se la telecamera sta davvero mandando frame:
+    finché è False l'heartbeat è sospeso, così il backend vede online solo le
+    zone con una telecamera funzionante. Alla ripresa il primo invio è immediato.
     """
 
     def __init__(
@@ -433,6 +534,7 @@ class HeartbeatService:
         mqtt_client,
         interval: Optional[float] = None,
         device_id: Optional[str] = None,
+        is_active: Optional[Callable[[], bool]] = None,
     ):
         self.mqtt_client = mqtt_client
         self.interval = float(
@@ -441,6 +543,7 @@ class HeartbeatService:
             else getattr(config, "HEARTBEAT_INTERVAL_SECONDS", 60)
         )
         self.device_id = device_id or config.DEVICE_ID
+        self.is_active = is_active
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -474,27 +577,45 @@ class HeartbeatService:
             logger.info("Heartbeat service arrestato.")
 
     def _run(self):
-        # Primo invio immediato per comunicare istantaneamente lo stato online
-        try:
-            publish_heartbeat(self.mqtt_client, self.device_id)
-        except Exception as e:
-            logger.error(f"Errore primo invio heartbeat: {e}")
-
-        # Ciclo periodico: attende l'intervallo o termina subito alla chiamata di stop()
-        while not self._stop_event.wait(self.interval):
+        # Controllo ogni secondo, invio ogni 'interval': così l'heartbeat parte
+        # subito quando la telecamera (o il broker) torna disponibile.
+        # last_sent = None significa "zona non annunciata": il prossimo invio è immediato.
+        last_sent = None
+        active = None
+        while True:
             try:
-                publish_heartbeat(self.mqtt_client, self.device_id)
+                now_active = self.is_active is None or bool(self.is_active())
+                if now_active != active:
+                    if active is not None or not now_active:
+                        state = "ripreso" if now_active else "sospeso (telecamera senza segnale)"
+                        logger.info(f"Heartbeat {self.device_id} {state}.")
+                    active = now_active
+                    last_sent = None
+
+                if active and _mqtt_connected(self.mqtt_client):
+                    now = time.time()
+                    if last_sent is None or now - last_sent >= self.interval:
+                        publish_heartbeat(self.mqtt_client, self.device_id)
+                        last_sent = now
+                elif active:
+                    # Broker giù: alla riconnessione l'heartbeat riparte subito
+                    last_sent = None
             except Exception as e:
                 logger.error(f"Errore ciclo heartbeat: {e}")
+
+            # Attende o termina subito alla chiamata di stop()
+            if self._stop_event.wait(1.0):
+                break
 
 
 def start_heartbeat(
     mqtt_client,
     interval: Optional[float] = None,
     device_id: Optional[str] = None,
+    is_active: Optional[Callable[[], bool]] = None,
 ) -> HeartbeatService:
     """Helper per istanziare e avviare il servizio di heartbeat in background."""
-    service = HeartbeatService(mqtt_client, interval=interval, device_id=device_id)
+    service = HeartbeatService(mqtt_client, interval=interval, device_id=device_id, is_active=is_active)
     return service.start()
 
 

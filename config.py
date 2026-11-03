@@ -30,14 +30,23 @@ HANDS_MODEL_COMPLEXITY = 0
 # NON più un unico MAC). Registra questi device_id nella lista dispositivi del
 # server, uno per zona.
 #
-# 'camera_index' è il path stabile V4L2 by-id: identifica fisicamente la
-# telecamera indipendentemente dall'ordine di enumerazione USB all'avvio.
-# (Su Windows/PC per un test locale puoi mettere un intero: 0, 1, ...)
+# 'camera_index' può essere:
+#   - "auto": la zona prende la prima telecamera USB libera (qualunque modello),
+#     in ordine di zona; con una sola telecamera collegata si accende solo la
+#     prima zona. Con due telecamere l'abbinamento zona/telecamera segue l'ordine
+#     alfabetico dei nomi in /dev/v4l/by-id (stabile finché sono le stesse).
+#   - un path V4L2 by-id: fissa quella telecamera fisica a quella zona,
+#     indipendentemente dall'ordine di enumerazione USB (es.
+#     "/dev/v4l/by-id/usb-USB_Cam_Manufacturer_HDMI_USB_Camera_88901c069d01ae53-video-index0").
+#     Un path fisso non viene mai preso da una zona "auto".
+#   - un intero (0, 1, ...) per un test locale su Windows/PC.
+# Una zona si annuncia al backend (handshake + heartbeat) solo mentre la sua
+# telecamera manda frame: senza telecamera la zona risulta offline.
 CAMERAS = [
     {
         "device_id": "treeeyes_zona_a",
         "zone": "Zona A",
-        "camera_index": "/dev/v4l/by-id/usb-Sonix_Technology_Co.__Ltd._USB_2.0_Camera-video-index0",
+        "camera_index": "auto",
         "width": CAMERA_WIDTH,
         "height": CAMERA_HEIGHT,
         "fps": CAMERA_FPS,
@@ -45,7 +54,7 @@ CAMERAS = [
     {
         "device_id": "treeeyes_zona_b",
         "zone": "Zona B",
-        "camera_index": "/dev/v4l/by-id/usb-Sonix_Technology_Co.__Ltd._USB_2.0_Camera_SN5100-video-index0",
+        "camera_index": "auto",
         "width": CAMERA_WIDTH,
         "height": CAMERA_HEIGHT,
         "fps": CAMERA_FPS,
@@ -54,8 +63,13 @@ CAMERAS = [
 
 # --- Retrocompatibilità (single-camera: main_pc_backup.py, test_camera.py) -
 # Alias sulla prima telecamera, così i vecchi script a singola telecamera
-# continuano a funzionare senza modifiche.
+# continuano a funzionare senza modifiche. "auto" diventa la prima telecamera
+# USB collegata (non /dev/video0: sull'Orange Pi è l'ingresso HDMI della scheda).
 CAMERA_INDEX = CAMERAS[0]["camera_index"]
+if CAMERA_INDEX == "auto":
+    import glob as _glob
+    _usb_cams = sorted(_glob.glob("/dev/v4l/by-id/*-video-index0"))
+    CAMERA_INDEX = _usb_cams[0] if _usb_cams else 0
 
 # device_id di fallback, usato SOLO se una funzione viene chiamata senza un
 # device_id esplicito. Con il multi-camera ogni pipeline passa sempre il proprio.
@@ -79,6 +93,10 @@ BACKEND_VIDEO_UPLOAD_URL = BACKEND_CLIP_URL                 # Retrocompatibilit�
 
 # Timeout richieste HTTP in secondi
 HTTP_TIMEOUT_SECONDS = 10
+
+# Se il backend non risponde all'handshake (es. rete non ancora pronta
+# all'accensione) si ritenta ogni N secondi finché non risponde.
+HANDSHAKE_RETRY_SECONDS = 30
 
 # --- MQTT -----------------------------------------------------------------
 MQTT_ENABLED = True                  # Imposta a False per disabilitare MQTT (test offline)
