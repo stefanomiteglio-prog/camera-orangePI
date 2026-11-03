@@ -5,7 +5,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
-from rknnlite.api import RKNNLite
 
 import config
 from events import (
@@ -22,7 +21,8 @@ import hud
 import vlm_confirm
 from video_clip import ClipRecorder
 from logger import logger
-from rknn_backend import PoseModel, DetectModel, WeaponModel, SimpleTracker, POSE_SKELETON, WEAPON_CLASSES
+from rknn_backend import (PoseModel, DetectModel, WeaponModel, SimpleTracker, POSE_SKELETON, WEAPON_CLASSES,
+                          preprocess, core_mask_from)
 
 POSE_RKNN_PATH = getattr(config, "POSE_RKNN_PATH", "yolov8s-pose.rknn")
 DETECT_RKNN_PATH = getattr(config, "DETECT_RKNN_PATH", "rknn_test/rknn_model_zoo/examples/yolov8/model/yolov8n.rknn")
@@ -286,8 +286,10 @@ class VideoCaptureThread:
         if self.new_frame_event.wait(timeout=timeout):
             self.new_frame_event.clear()
             with self.lock:
+                # Nessuna copia: il thread di cattura sostituisce il frame con un
+                # array nuovo a ogni lettura e non modifica mai quello consegnato.
                 if self.frame is not None:
-                    return True, self.frame.copy()
+                    return True, self.frame
         return False, None
 
     def release(self):
@@ -315,29 +317,33 @@ class CameraPipeline(threading.Thread):
     di rendering (con HUD ed etichette), che il thread principale compone e mostra.
     """
 
-    def __init__(self, cam_cfg, mqtt_client):
+    def __init__(self, cam_cfg, mqtt_client, index=0):
         super().__init__(daemon=True)
         self.cam_cfg = cam_cfg
         self.device_id = cam_cfg["device_id"]
         self.zone = cam_cfg.get("zone", self.device_id)
         self.mqtt_client = mqtt_client
 
-        # Modelli NPU PROPRI della pipeline, su NPU_CORE_AUTO: il runtime RKNN
-        # bilancia le inferenze delle due telecamere sui 3 core del RK3588,
-        # ottenendo vero parallelismo (niente lock che serializza su un core solo).
-        logger.info(f"[{self.zone}] Caricamento modelli NPU dedicati (AUTO core)...")
-        self.detect_model = DetectModel(DETECT_RKNN_PATH, core_mask=RKNNLite.NPU_CORE_AUTO, conf_thresh=config.CONF_THRESHOLD)
-        self.pose_model = PoseModel(POSE_RKNN_PATH, core_mask=RKNNLite.NPU_CORE_AUTO, conf_thresh=config.CONF_THRESHOLD)
+        # Modelli NPU PROPRI della pipeline, ciascuno sul core indicato in
+        # config.NPU_CORES (una voce per telecamera): inferenze delle due
+        # telecamere in parallelo sui 3 core del RK3588, senza lock.
+        layouts = getattr(config, "NPU_CORES", [])
+        cores = layouts[index] if index < len(layouts) else {}
+        logger.info(f"[{self.zone}] Caricamento modelli NPU dedicati (core: {cores or 'auto'})...")
+        self.detect_model = DetectModel(DETECT_RKNN_PATH, core_mask=core_mask_from(cores.get("detect")), conf_thresh=config.CONF_THRESHOLD)
+        self.pose_model = PoseModel(POSE_RKNN_PATH, core_mask=core_mask_from(cores.get("pose")), conf_thresh=config.CONF_THRESHOLD)
 
         # Modello armi dedicato (Gun/explosion/grenade/knife). Opzionale: se il
         # file .rknn manca la pipeline prosegue con i soli modelli COCO/pose.
         self.weapon_model = None
         if getattr(config, "WEAPON_ENABLED", True):
             try:
+                # Sotto ALERT_MIN_CONF le armi vengono comunque scartate: filtrarle
+                # già nel post-processing evita NMS e risultati inutili.
                 self.weapon_model = WeaponModel(
                     WEAPON_RKNN_PATH,
-                    core_mask=RKNNLite.NPU_CORE_AUTO,
-                    conf_thresh=getattr(config, "WEAPON_CONF_THRESHOLD", 0.35),
+                    core_mask=core_mask_from(cores.get("weapon")),
+                    conf_thresh=max(getattr(config, "WEAPON_CONF_THRESHOLD", 0.35), ALERT_MIN_CONF),
                     classes=getattr(config, "WEAPON_CLASSES", WEAPON_CLASSES),
                 )
             except Exception as e:
@@ -354,6 +360,9 @@ class CameraPipeline(threading.Thread):
         self.detect_every = max(1, getattr(config, "DETECT_PROCESS_EVERY", 2))
         self.weapon_every = max(1, getattr(config, "WEAPON_PROCESS_EVERY", 2))
         self.hands_every = max(1, getattr(config, "HANDS_PROCESS_EVERY", 3))
+        self.hands_only_with_person = getattr(config, "HANDS_ONLY_WITH_PERSON", True)
+        # In headless nessuno guarda il video: niente box/HUD da disegnare
+        self.draw = not getattr(config, "HEADLESS", False)
 
         # Conferma a tempo delle armi: danger_type -> istante di primo/ultimo avvistamento
         self.danger_first_seen = {}
@@ -371,6 +380,7 @@ class CameraPipeline(threading.Thread):
         self._last_fps_t = time.time()
 
         self.latest_display = None
+        self.display_version = 0   # incrementato a ogni nuovo frame di display
         self.display_lock = threading.Lock()
         self.running = False
         self.signal_lost = False
@@ -405,10 +415,9 @@ class CameraPipeline(threading.Thread):
         return True
 
     def get_display(self):
+        # Senza copia: ogni frame pubblicato è un array nuovo, mai modificato dopo
         with self.display_lock:
-            if self.latest_display is None:
-                return None
-            return self.latest_display.copy()
+            return self.latest_display
 
     def stop(self):
         self.running = False
@@ -429,6 +438,7 @@ class CameraPipeline(threading.Thread):
         logger.warning(f"[{self.zone}] Nessun segnale video: pipeline in attesa della telecamera.")
         with self.display_lock:
             self.latest_display = None
+            self.display_version += 1
         self.danger_first_seen.clear()
         self.danger_last_seen.clear()
         self.crowd_start_time = None
@@ -468,24 +478,35 @@ class CameraPipeline(threading.Thread):
             self.frame_idx += 1
 
             # 1. Aggiorna buffer circolare clip video con il frame raw pulito
-            self.clip.update(raw_frame)
+            #    (raw_frame non viene più modificato: niente copia)
+            self.clip.update(raw_frame, copy=False)
 
             detected_this_frame = set()
             person_count = 0
 
             # 2. Inferenze in parallelo su thread dedicati, con cadenze indipendenti.
             #    I risultati vengono riusati nei frame in cui l'inferenza è saltata.
+            #    Letterbox + RGB calcolati una volta sola e condivisi dai modelli NPU.
             futures = {}
-            if self.frame_idx % self.pose_every == 0:
-                futures["pose"] = self.executor.submit(self.pose_model.infer, raw_frame)
-            if self.frame_idx % self.detect_every == 0:
-                futures["detect"] = self.executor.submit(self.detect_model.infer, raw_frame)
+            run_pose = self.frame_idx % self.pose_every == 0
+            run_detect = self.frame_idx % self.detect_every == 0
             # Sfalsata di un frame rispetto a COCO per non sommare i due carichi NPU
-            if self.weapon_model is not None and (self.frame_idx + 1) % self.weapon_every == 0:
-                futures["weapon"] = self.executor.submit(self.weapon_model.infer, raw_frame)
+            run_weapon = self.weapon_model is not None and (self.frame_idx + 1) % self.weapon_every == 0
+            prep = preprocess(raw_frame, self.pose_model.input_size) if (run_pose or run_detect or run_weapon) else None
+            if run_pose:
+                futures["pose"] = self.executor.submit(self.pose_model.infer, raw_frame, prep)
+            if run_detect:
+                futures["detect"] = self.executor.submit(self.detect_model.infer, raw_frame, prep)
+            if run_weapon:
+                futures["weapon"] = self.executor.submit(self.weapon_model.infer, raw_frame, prep)
             if self.frame_idx % self.hands_every == 0:
-                small_raw = cv2.resize(raw_frame, (raw_frame.shape[1] // 2, raw_frame.shape[0] // 2))
-                futures["hands"] = self.executor.submit(self.gesture.detect, small_raw)
+                # MediaPipe (CPU) solo se nel frame precedente c'era qualcuno
+                someone = bool(self.last_pose) or any(d["class_name"] == "person" for d in self.last_detections)
+                if someone or not self.hands_only_with_person:
+                    small_raw = cv2.resize(raw_frame, (raw_frame.shape[1] // 2, raw_frame.shape[0] // 2))
+                    futures["hands"] = self.executor.submit(self.gesture.detect, small_raw, False)
+                else:
+                    self.gesture.idle()
 
             if "pose" in futures:
                 self.last_pose = futures["pose"].result()
@@ -498,8 +519,9 @@ class CameraPipeline(threading.Thread):
             pose_results = self.last_pose
             detections = self.last_detections
 
-            # 3. Frame di rendering dedicato all'HUD
-            display_frame = raw_frame.copy()
+            # 3. Frame di rendering dedicato all'HUD (solo con finestra a schermo)
+            draw = self.draw
+            display_frame = raw_frame.copy() if draw else None
 
             # --- Analisi Oggetti Pericolosi (COCO + modello armi dedicato) ---
             # danger_type -> confidenza migliore nel frame: ogni tipo conta una
@@ -520,6 +542,8 @@ class CameraPipeline(threading.Thread):
             for danger_type, class_name, det in danger_dets:
                 confidence = det["score"]
                 dangers[danger_type] = max(dangers.get(danger_type, 0.0), confidence)
+                if not draw:
+                    continue
                 x1, y1, x2, y2 = map(int, det["box"])
                 cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
                 cv2.putText(display_frame, f"{class_name} {confidence:.2f}", (x1, max(20, y1 - 8)),
@@ -547,7 +571,7 @@ class CameraPipeline(threading.Thread):
             # --- Analisi Pose ---
             tracked = self.tracker.update(pose_results)
 
-            for det in tracked:
+            for det in (tracked if draw else ()):
                 track_id = det["track_id"]
                 x1, y1, x2, y2 = map(int, det["box"])
                 cv2.rectangle(display_frame, (x1, y1), (x2, y2), (255, 200, 0), 2)
@@ -597,29 +621,41 @@ class CameraPipeline(threading.Thread):
                 self._fps = inst if self._fps == 0 else (self._fps * 0.9 + inst * 0.1)
             self._last_fps_t = now
 
-            hud.draw_progress_bar(display_frame, "Gesto aiuto", self.gesture.progress())
-            hud.draw_panel(display_frame, [
-                ("Persone", False, f"({person_count})"),
-                ("Arma", bool(dangers), "(" + ", ".join(f"{t} {s:.1f}s" for t, s in danger_held.items()) + ")" if dangers else ""),
-                ("Assembramento", self.crowd_start_time is not None, ""),
-                ("Gesto aiuto", gesture_triggered, ""),
-            ], recording=self.clip.is_recording())
+            if self.frame_idx % 300 == 0:
+                npu = ", ".join(
+                    f"{name} {m.npu_ms:.1f}ms"
+                    for name, m in (("pose", self.pose_model), ("detect", self.detect_model), ("weapon", self.weapon_model))
+                    if m is not None
+                )
+                logger.info(f"[{self.zone}] Prestazioni: {self._fps:.1f} FPS, NPU ms medi: {npu}")
 
-            # Etichetta zona (in alto a destra della sotto-immagine) + FPS
-            fh, fw = display_frame.shape[:2]
-            cv2.putText(display_frame, f"{self.zone}", (fw - 200, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(display_frame, f"{self._fps:.0f} FPS", (fw - 120, fh - 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
-
-            with self.display_lock:
-                self.latest_display = display_frame
+            if draw:
+                self._draw_hud(display_frame, person_count, dangers, danger_held, gesture_triggered)
+                with self.display_lock:
+                    self.latest_display = display_frame
+                    self.display_version += 1
 
             if getattr(config, "HEADLESS", False) and self.frame_idx % 150 == 0:
                 logger.info(
                     f"[{self.zone}] Status: frame={self.frame_idx}, persone={person_count}, "
                     f"allarmi_attivi={list(detected_this_frame)}, clip_rec={self.clip.is_recording()}, fps={self._fps:.1f}"
                 )
+
+    def _draw_hud(self, display_frame, person_count, dangers, danger_held, gesture_triggered):
+        hud.draw_progress_bar(display_frame, "Gesto aiuto", self.gesture.progress())
+        hud.draw_panel(display_frame, [
+            ("Persone", False, f"({person_count})"),
+            ("Arma", bool(dangers), "(" + ", ".join(f"{t} {s:.1f}s" for t, s in danger_held.items()) + ")" if dangers else ""),
+            ("Assembramento", self.crowd_start_time is not None, ""),
+            ("Gesto aiuto", gesture_triggered, ""),
+        ], recording=self.clip.is_recording())
+
+        # Etichetta zona (in alto a destra della sotto-immagine) + FPS
+        fh, fw = display_frame.shape[:2]
+        cv2.putText(display_frame, f"{self.zone}", (fw - 200, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(display_frame, f"{self._fps:.0f} FPS", (fw - 120, fh - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
 
     def _cleanup(self):
         if self.capture is not None:
@@ -644,16 +680,20 @@ def _placeholder(zone, width=1280, height=720):
     return img
 
 
-def compose_grid(pipelines, target_h=720):
+def compose_grid(pipelines, target_h=None):
     """
     Compone i display delle telecamere affiancati orizzontalmente,
     normalizzando all'altezza target e separandoli con una sottile linea.
+    Senza target_h si usa l'altezza nativa dei frame: nessun ingrandimento su
+    CPU, la scala a schermo intero la fa già la finestra.
     """
     # Solo le zone con segnale: con una telecamera sola si vede a tutto schermo.
     # Se nessuna ha segnale, un riquadro di attesa per ogni zona.
     frames = [f for f in (p.get_display() for p in pipelines) if f is not None]
     if not frames:
         frames = [_placeholder(p.zone) for p in pipelines]
+    if target_h is None:
+        target_h = max(f.shape[0] for f in frames)
 
     tiles = []
     for frame in frames:
@@ -693,7 +733,7 @@ def main():
     last_cleanup_time = time.time()
 
     # 2. Avvio pipeline (una per telecamera, con modelli NPU dedicati)
-    pipelines = [CameraPipeline(cam, mqtt_client) for cam in cameras]
+    pipelines = [CameraPipeline(cam, mqtt_client, index=i) for i, cam in enumerate(cameras)]
     for p in pipelines:
         p.start()
 
@@ -726,6 +766,9 @@ def main():
     )
 
     first_shown = False
+    shown_versions = None
+    last_show = 0.0
+    min_show_interval = 1.0 / max(1, getattr(config, "DISPLAY_MAX_FPS", 30))
     try:
         while True:
             # Pulizia periodica storage
@@ -736,8 +779,14 @@ def main():
                 last_cleanup_time = now
 
             if not getattr(config, "HEADLESS", False):
-                grid = compose_grid(pipelines)
-                cv2.imshow(window_name, grid)
+                # Ricomposizione solo se una telecamera ha un frame nuovo (e al massimo
+                # a DISPLAY_MAX_FPS): prima il ciclo girava a vuoto occupando un core.
+                versions = tuple(p.display_version for p in pipelines)
+                if versions != shown_versions and now - last_show >= min_show_interval:
+                    shown_versions = versions
+                    last_show = now
+                    grid = compose_grid(pipelines)
+                    cv2.imshow(window_name, grid)
 
                 if not first_shown:
                     first_shown = True
@@ -746,7 +795,7 @@ def main():
                     if is_fullscreen:
                         cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-                key = cv2.waitKey(1) & 0xFF
+                key = cv2.waitKey(5) & 0xFF
                 if key == ord("q") or key == 27:
                     break
                 if key == ord("r"):

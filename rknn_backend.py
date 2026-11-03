@@ -1,3 +1,5 @@
+import time
+
 import cv2
 import numpy as np
 from rknnlite.api import RKNNLite
@@ -20,11 +22,48 @@ def letterbox(img, size=640, color=114):
     h, w = img.shape[:2]
     r = min(size / h, size / w)
     nh, nw = int(round(h * r)), int(round(w * r))
-    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
-    canvas = np.full((size, size, 3), color, dtype=np.uint8)
+    # Con 640x480 r == 1: niente resize, solo il bordo (copyMakeBorder, in C++)
+    resized = img if (nh, nw) == (h, w) else cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
     top, left = (size - nh) // 2, (size - nw) // 2
-    canvas[top:top+nh, left:left+nw] = resized
+    canvas = cv2.copyMakeBorder(resized, top, size - nh - top, left, size - nw - left,
+                                cv2.BORDER_CONSTANT, value=(color, color, color))
     return canvas, r, left, top
+
+
+def preprocess(frame, size=640):
+    """
+    Input NPU pronto (RGB letterbox NHWC) + parametri per riportare i box sul frame.
+    Calcolato UNA volta per frame e condiviso da tutti i modelli con lo stesso input_size;
+    la conversione colore è fatta sul frame originale (più piccolo del 640x640).
+    """
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    img, ratio, dx, dy = letterbox(rgb, size)
+    return np.expand_dims(img, axis=0), ratio, dx, dy, size
+
+
+def _nms(boxes, scores, nms_thresh, class_ids=None):
+    """
+    NMS greedy. Con class_ids è per classe in un solo passaggio: i box di classi
+    diverse vengono traslati lontano tra loro, così non si sovrappongono mai.
+    """
+    if class_ids is not None:
+        # float64: in float32 l'offset farebbe perdere precisione alle coordinate
+        boxes = boxes.astype(np.float64) + (class_ids.astype(np.float64) * 8192.0)[:, None]
+    areas = (boxes[:,2]-boxes[:,0])*(boxes[:,3]-boxes[:,1])
+    idxs = scores.argsort()[::-1]
+    keep = []
+    while len(idxs) > 0:
+        i = idxs[0]
+        keep.append(i)
+        if len(idxs) == 1:
+            break
+        rest = idxs[1:]
+        xx1 = np.maximum(boxes[i,0], boxes[rest,0]); yy1 = np.maximum(boxes[i,1], boxes[rest,1])
+        xx2 = np.minimum(boxes[i,2], boxes[rest,2]); yy2 = np.minimum(boxes[i,3], boxes[rest,3])
+        inter = np.maximum(0, xx2-xx1) * np.maximum(0, yy2-yy1)
+        iou = inter/(areas[i]+areas[rest]-inter+1e-6)
+        idxs = rest[iou <= nms_thresh]
+    return keep
 
 
 def _make_rknnlite(model_path, core_mask):
@@ -34,48 +73,53 @@ def _make_rknnlite(model_path, core_mask):
     return rknn
 
 
-class PoseModel:
-    def __init__(self, model_path, core_mask=RKNNLite.NPU_CORE_1, conf_thresh=0.5, nms_thresh=0.45, input_size=640):
+def core_mask_from(value):
+    """0/1/2 -> singolo core NPU del RK3588; "auto" (o altro) -> scelta del runtime."""
+    masks = {0: RKNNLite.NPU_CORE_0, 1: RKNNLite.NPU_CORE_1, 2: RKNNLite.NPU_CORE_2}
+    return masks.get(value, RKNNLite.NPU_CORE_AUTO)
+
+
+class _RknnModel:
+    """Base comune: contesto RKNN, preprocessing condiviso e tempo medio di inferenza NPU."""
+
+    def __init__(self, model_path, core_mask, conf_thresh, nms_thresh, input_size):
         self.rknn = _make_rknnlite(model_path, core_mask)
         self.conf_thresh = conf_thresh
         self.nms_thresh = nms_thresh
         self.input_size = input_size
+        self.npu_ms = 0.0   # media mobile del solo tempo NPU (senza pre/post-processing)
 
-    def _nms(self, boxes, scores):
-        idxs = scores.argsort()[::-1]
-        keep = []
-        while len(idxs) > 0:
-            i = idxs[0]
-            keep.append(i)
-            if len(idxs) == 1:
-                break
-            rest = idxs[1:]
-            xx1 = np.maximum(boxes[i,0], boxes[rest,0]); yy1 = np.maximum(boxes[i,1], boxes[rest,1])
-            xx2 = np.minimum(boxes[i,2], boxes[rest,2]); yy2 = np.minimum(boxes[i,3], boxes[rest,3])
-            w = np.maximum(0, xx2-xx1); h = np.maximum(0, yy2-yy1)
-            inter = w*h
-            area_i = (boxes[i,2]-boxes[i,0])*(boxes[i,3]-boxes[i,1])
-            area_r = (boxes[rest,2]-boxes[rest,0])*(boxes[rest,3]-boxes[rest,1])
-            iou = inter/(area_i+area_r-inter+1e-6)
-            idxs = rest[iou <= self.nms_thresh]
-        return keep
+    def _run(self, frame, prep):
+        if prep is None or prep[4] != self.input_size:
+            prep = preprocess(frame, self.input_size)
+        t0 = time.perf_counter()
+        outputs = self.rknn.inference(inputs=[prep[0]])
+        ms = (time.perf_counter() - t0) * 1000.0
+        self.npu_ms = ms if self.npu_ms == 0 else self.npu_ms * 0.9 + ms * 0.1
+        return outputs, prep[1], prep[2], prep[3]
 
-    def infer(self, frame):
-        img, ratio, dx, dy = letterbox(frame, self.input_size)
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        outputs = self.rknn.inference(inputs=[np.expand_dims(rgb, axis=0)])
-        out = outputs[0][0].transpose(1, 0)
-        conf = out[:, 4]
-        mask = conf >= self.conf_thresh
-        out = out[mask]
+    def release(self):
+        self.rknn.release()
+
+
+class PoseModel(_RknnModel):
+    def __init__(self, model_path, core_mask=RKNNLite.NPU_CORE_1, conf_thresh=0.5, nms_thresh=0.45, input_size=640):
+        super().__init__(model_path, core_mask, conf_thresh, nms_thresh, input_size)
+
+    def infer(self, frame, prep=None):
+        outputs, ratio, dx, dy = self._run(frame, prep)
+        o = outputs[0][0]                       # (56, 8400)
+        # Filtro sulla confidenza PRIMA della trasposizione: si copiano solo le colonne valide
+        idx = np.nonzero(o[4] >= self.conf_thresh)[0]
         results = []
-        if len(out) == 0:
+        if len(idx) == 0:
             return results
+        out = o[:, idx].T
         cx, cy, w, h = out[:,0], out[:,1], out[:,2], out[:,3]
         boxes = np.stack([cx-w/2, cy-h/2, cx+w/2, cy+h/2], axis=1)
         scores = out[:,4]
         kpts = out[:,5:].reshape(-1,17,3)
-        keep = self._nms(boxes, scores)
+        keep = _nms(boxes, scores, self.nms_thresh)
         for i in keep:
             b = boxes[i]
             x1 = (b[0]-dx)/ratio; y1=(b[1]-dy)/ratio; x2=(b[2]-dx)/ratio; y2=(b[3]-dy)/ratio
@@ -85,142 +129,88 @@ class PoseModel:
             results.append({"box":[x1,y1,x2,y2], "score": float(scores[i]), "keypoints": kp})
         return results
 
-    def release(self):
-        self.rknn.release()
-
 
 WEAPON_CLASSES = ("Gun", "explosion", "grenade", "knife")
 
 
-class WeaponModel:
+class WeaponModel(_RknnModel):
     """
     Modello armi/minacce (weapon_threat.rknn): head YOLOv8 a output singolo
     (1, 4+num_classi, 8400) con box cx,cy,w,h e score per classe gia' decodificati.
     """
     def __init__(self, model_path, core_mask=RKNNLite.NPU_CORE_2, conf_thresh=0.35, nms_thresh=0.45, input_size=640, classes=WEAPON_CLASSES):
-        self.rknn = _make_rknnlite(model_path, core_mask)
-        self.conf_thresh = conf_thresh
-        self.nms_thresh = nms_thresh
-        self.input_size = input_size
+        super().__init__(model_path, core_mask, conf_thresh, nms_thresh, input_size)
         self.classes = tuple(classes)
 
-    _nms = PoseModel._nms
-
-    def infer(self, frame):
-        img, ratio, dx, dy = letterbox(frame, self.input_size)
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        outputs = self.rknn.inference(inputs=[np.expand_dims(rgb, axis=0)])
-        out = outputs[0][0].transpose(1, 0)
-        class_scores = out[:, 4:4 + len(self.classes)]
-        cls_ids = np.argmax(class_scores, axis=1)
-        scores = np.max(class_scores, axis=1)
-        mask = scores >= self.conf_thresh
-        out = out[mask]; cls_ids = cls_ids[mask]; scores = scores[mask]
+    def infer(self, frame, prep=None):
+        outputs, ratio, dx, dy = self._run(frame, prep)
+        o = outputs[0][0]                       # (4+nc, 8400)
+        class_scores = o[4:4 + len(self.classes)]
+        scores = class_scores.max(axis=0)
+        idx = np.nonzero(scores >= self.conf_thresh)[0]
         results = []
-        if len(out) == 0:
+        if len(idx) == 0:
             return results
-        cx, cy, w, h = out[:,0], out[:,1], out[:,2], out[:,3]
+        cls_ids = class_scores[:, idx].argmax(axis=0); scores = scores[idx]
+        cx, cy, w, h = o[0, idx], o[1, idx], o[2, idx], o[3, idx]
         boxes = np.stack([cx-w/2, cy-h/2, cx+w/2, cy+h/2], axis=1)
-        keep = self._nms(boxes, scores)
+        keep = _nms(boxes, scores, self.nms_thresh)
         for i in keep:
             b = boxes[i]
             x1 = (b[0]-dx)/ratio; y1=(b[1]-dy)/ratio; x2=(b[2]-dx)/ratio; y2=(b[3]-dy)/ratio
             results.append({"box":[x1,y1,x2,y2], "score": float(scores[i]), "class_id": int(cls_ids[i]), "class_name": self.classes[int(cls_ids[i])]})
         return results
 
-    def release(self):
-        self.rknn.release()
+
+def _decode_branch(reg, cls, img_size, conf_thresh):
+    """
+    Un ramo della head YOLOv8 (rknn_model_zoo): reg (1,4*16,h,w) in formato DFL, cls (1,nc,h,w).
+    Soglia sulle classi PRIMA della DFL: softmax solo sulle celle candidate invece
+    che su tutte le 8400 (la parte più costosa del post-processing su CPU).
+    """
+    _, nc, gh, gw = cls.shape
+    c = cls[0].reshape(nc, gh * gw)
+    cmax = c.max(axis=0)
+    idx = np.nonzero(cmax >= conf_thresh)[0]
+    if len(idx) == 0:
+        return None
+    mc = reg.shape[1] // 4
+    r = reg[0].reshape(4, mc, gh * gw)[:, :, idx]                   # (4, 16, k)
+    e = np.exp(r - r.max(axis=1, keepdims=True))
+    acc = np.arange(mc, dtype=np.float32).reshape(1, mc, 1)
+    d = (e * acc).sum(axis=1) / e.sum(axis=1)                       # (4, k)
+    col = (idx % gw).astype(np.float32) + 0.5
+    row = (idx // gw).astype(np.float32) + 0.5
+    stride = img_size / gh
+    boxes = np.stack([col - d[0], row - d[1], col + d[2], row + d[3]], axis=1) * stride
+    return boxes, cmax[idx], c[:, idx].argmax(axis=0)
 
 
-def _dfl(position):
-    n, c, h, w = position.shape
-    p_num = 4
-    mc = c // p_num
-    y = position.reshape(n, p_num, mc, h, w)
-    e = np.exp(y - np.max(y, axis=2, keepdims=True))
-    y = e / np.sum(e, axis=2, keepdims=True)
-    acc = np.arange(mc).reshape(1,1,mc,1,1).astype(np.float32)
-    return (y * acc).sum(2)
-
-
-def _box_process(position, img_size=640):
-    grid_h, grid_w = position.shape[2:4]
-    col, row = np.meshgrid(np.arange(grid_w), np.arange(grid_h))
-    col = col.reshape(1,1,grid_h,grid_w); row = row.reshape(1,1,grid_h,grid_w)
-    grid = np.concatenate((col,row), axis=1)
-    stride = np.array([img_size//grid_h, img_size//grid_w]).reshape(1,2,1,1)
-    position = _dfl(position)
-    box_xy = grid + 0.5 - position[:,0:2,:,:]
-    box_xy2 = grid + 0.5 + position[:,2:4,:,:]
-    xyxy = np.concatenate((box_xy*stride, box_xy2*stride), axis=1)
-    return xyxy
-
-
-def _sp_flatten(x):
-    ch = x.shape[1]
-    return x.transpose(0,2,3,1).reshape(-1, ch)
-
-
-class DetectModel:
+class DetectModel(_RknnModel):
     def __init__(self, model_path, core_mask=RKNNLite.NPU_CORE_0, conf_thresh=0.25, nms_thresh=0.45, input_size=640, classes=COCO_CLASSES):
-        self.rknn = _make_rknnlite(model_path, core_mask)
-        self.conf_thresh = conf_thresh
-        self.nms_thresh = nms_thresh
-        self.input_size = input_size
+        super().__init__(model_path, core_mask, conf_thresh, nms_thresh, input_size)
         self.classes = classes
 
-    def _nms_boxes(self, boxes, scores):
-        x, y = boxes[:,0], boxes[:,1]
-        w, h = boxes[:,2]-boxes[:,0], boxes[:,3]-boxes[:,1]
-        areas = w*h
-        order = scores.argsort()[::-1]
-        keep = []
-        while order.size > 0:
-            i = order[0]; keep.append(i)
-            xx1 = np.maximum(x[i], x[order[1:]]); yy1 = np.maximum(y[i], y[order[1:]])
-            xx2 = np.minimum(x[i]+w[i], x[order[1:]]+w[order[1:]]); yy2 = np.minimum(y[i]+h[i], y[order[1:]]+h[order[1:]])
-            w1 = np.maximum(0.0, xx2-xx1+1e-5); h1 = np.maximum(0.0, yy2-yy1+1e-5)
-            inter = w1*h1
-            ovr = inter/(areas[i]+areas[order[1:]]-inter)
-            inds = np.where(ovr <= self.nms_thresh)[0]
-            order = order[inds+1]
-        return np.array(keep, dtype=int)
-
-    def infer(self, frame):
-        img, ratio, dx, dy = letterbox(frame, self.input_size)
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        outputs = self.rknn.inference(inputs=[np.expand_dims(rgb, axis=0)])
-        boxes_l, scores_l, classes_conf_l = [], [], []
-        for i in range(3):
-            boxes_l.append(_box_process(outputs[3*i], self.input_size))
-            classes_conf_l.append(outputs[3*i+1])
-            scores_l.append(np.ones_like(outputs[3*i+1][:, :1, :, :], dtype=np.float32))
-
-        boxes = np.concatenate([_sp_flatten(b) for b in boxes_l])
-        classes_conf = np.concatenate([_sp_flatten(c) for c in classes_conf_l])
-        scores = np.concatenate([_sp_flatten(s) for s in scores_l])
-
-        box_conf = scores.reshape(-1)
-        class_max = np.max(classes_conf, axis=-1)
-        classes = np.argmax(classes_conf, axis=-1)
-        pos = np.where(class_max * box_conf >= self.conf_thresh)
-        boxes = boxes[pos]; classes = classes[pos]; final_scores = (class_max*box_conf)[pos]
-
+    def infer(self, frame, prep=None):
+        outputs, ratio, dx, dy = self._run(frame, prep)
+        # Model zoo: 3 output per ramo (box DFL, classi, score_sum), 3 rami
+        per_branch = len(outputs) // 3
+        parts = [_decode_branch(outputs[per_branch*i], outputs[per_branch*i+1], self.input_size, self.conf_thresh)
+                 for i in range(3)]
+        parts = [p for p in parts if p is not None]
         results = []
-        if len(boxes) == 0:
+        if not parts:
             return results
-        for c in set(classes):
-            inds = np.where(classes == c)
-            b = boxes[inds]; s = final_scores[inds]
-            keep = self._nms_boxes(b, s)
-            for k in keep:
-                x1,y1,x2,y2 = b[k]
-                x1=(x1-dx)/ratio; y1=(y1-dy)/ratio; x2=(x2-dx)/ratio; y2=(y2-dy)/ratio
-                results.append({"box":[x1,y1,x2,y2], "score": float(s[k]), "class_id": int(c), "class_name": self.classes[int(c)]})
+        boxes = np.concatenate([p[0] for p in parts])
+        scores = np.concatenate([p[1] for p in parts])
+        classes = np.concatenate([p[2] for p in parts])
+        keep = _nms(boxes, scores, self.nms_thresh, class_ids=classes)
+        for k in keep:
+            x1,y1,x2,y2 = boxes[k]
+            x1=(x1-dx)/ratio; y1=(y1-dy)/ratio; x2=(x2-dx)/ratio; y2=(y2-dy)/ratio
+            c = int(classes[k])
+            results.append({"box":[x1,y1,x2,y2], "score": float(scores[k]), "class_id": c, "class_name": self.classes[c]})
         return results
-
-    def release(self):
-        self.rknn.release()
 
 
 class SimpleTracker:

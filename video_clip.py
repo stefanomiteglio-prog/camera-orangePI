@@ -23,14 +23,20 @@ class ClipRecorder:
     def is_recording(self) -> bool:
         return self.recording_until is not None
 
-    def update(self, frame):
+    def update(self, frame, copy=True):
+        """
+        copy=False evita la copia (~1 MB per frame): solo se il chiamante non
+        modifica più il frame dopo averlo passato (main.py lavora su frame raw immutabili).
+        """
         now = time.time()
-        self.buffer.append((now, frame.copy()))
+        if copy:
+            frame = frame.copy()
+        self.buffer.append((now, frame))
         while self.buffer and now - self.buffer[0][0] > config.VIDEO_CLIP_PRE_SECONDS:
             self.buffer.popleft()
 
         if self.recording_until is not None:
-            self.recording_frames.append((now, frame.copy()))
+            self.recording_frames.append((now, frame))
             if now >= self.recording_until:
                 self._finalize()
 

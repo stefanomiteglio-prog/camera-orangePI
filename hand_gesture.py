@@ -70,26 +70,31 @@ class HelpGestureDetector:
         elapsed = time.time() - self._state["tucked_since"]
         return min(1.0, elapsed / config.HELP_GESTURE_TUCKED_HOLD_SECONDS)
 
-    def detect(self, frame) -> bool:
+    def idle(self):
+        """Nessuna persona in scena: stesso effetto di un frame senza mani, senza eseguire MediaPipe."""
+        self._state["tucked_since"] = None
+        self._state["open_since"] = None
+
+    def detect(self, frame, draw=True) -> bool:
         """
         Rileva il "Signal for Help": palmo aperto seguito, entro pochi secondi,
         da un pugno chiuso col pollice ripiegato dentro il palmo.
         Soglie basate sul tempo reale (secondi), non su conteggio frame,
         così funzionano a qualsiasi framerate della pipeline.
-        Disegna gli skeleton delle mani sul frame passato (in-place).
+        Con draw=True disegna gli skeleton delle mani sul frame passato (in-place).
         """
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = self.hands.process(rgb)
         if not result.multi_hand_landmarks:
-            self._state["tucked_since"] = None
-            self._state["open_since"] = None
+            self.idle()
             return False
 
         triggered = False
         now = time.time()
 
         for hand_landmarks in result.multi_hand_landmarks:
-            mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            if draw:
+                mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
             lm = hand_landmarks.landmark
             diag = _hand_diag(lm)
 

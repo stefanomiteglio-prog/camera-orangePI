@@ -21,6 +21,9 @@ POSE_PROCESS_EVERY = 1     # stima pose/scheletro
 DETECT_PROCESS_EVERY = 2   # detection oggetti COCO (persone/bastone/coltello)
 WEAPON_PROCESS_EVERY = 2   # detection armi (weapon_threat.rknn), sfalsata di un frame rispetto a COCO
 HANDS_PROCESS_EVERY = 3    # gesto aiuto (MediaPipe, il più costoso su CPU)
+# MediaPipe gira sulla CPU: senza persone viste dal modello pose (NPU) è inutile
+# cercare mani, e si salta del tutto.
+HANDS_ONLY_WITH_PERSON = True
 
 # Complessità del modello MediaPipe Hands: 0 = lite (veloce), 1 = full (preciso)
 HANDS_MODEL_COMPLEXITY = 0
@@ -120,6 +123,18 @@ POSE_RKNN_PATH = "yolov8s-pose.rknn"
 DETECT_RKNN_PATH = "rknn_test/rknn_model_zoo/examples/yolov8/model/yolov8n.rknn"
 RKNN_TARGET = "rk3588"
 
+# Core NPU del RK3588 (0, 1, 2) assegnato a ogni modello, una voce per telecamera
+# nello stesso ordine di CAMERAS. "auto" lascia la scelta al runtime RKNN, che
+# però può mettere due inferenze sullo stesso core lasciandone un altro fermo.
+# Layout di default: la pose (yolov8s, il modello più pesante, ogni frame) ha un
+# core per telecamera; detect COCO e armi (più leggeri, a frame alterni, mai in
+# contemporanea nella stessa pipeline) condividono il core centrale.
+# Per verificare il bilanciamento guarda i tempi "NPU ms" nel log di stato.
+NPU_CORES = [
+    {"pose": 0, "detect": 1, "weapon": 1},
+    {"pose": 2, "detect": 1, "weapon": 1},
+]
+
 # Modello dedicato armi/minacce (presente solo sull'Orange Pi, nella cartella
 # del progetto). Se il file manca il nodo parte comunque, senza questo modello.
 WEAPON_ENABLED = True
@@ -148,6 +163,7 @@ WINDOW_NAME = "TreeEyes - Vision Node"  # Titolo della finestra
 WINDOW_FULLSCREEN = True       # True = avvia a schermo intero (fullscreen), False = finestra ridimensionabile
 WINDOW_MONITOR_X = 0           # Offset X (pixel) per selezionare il monitor (es. 0 per monitor principale, 1920 per secondo monitor HDMI)
 WINDOW_MONITOR_Y = 0           # Offset Y (pixel) del monitor desiderato
+DISPLAY_MAX_FPS = 30           # Ricomposizione finestra al massimo a questo ritmo, e solo con frame nuovi (libera CPU)
 
 # Gestione e ritenzione storage locale (pulizia automatica file obsoleti su SD/eMMC)
 MAX_SNAPSHOTS_COUNT = 500

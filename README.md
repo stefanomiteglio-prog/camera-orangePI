@@ -41,8 +41,11 @@ CAMERAS = [
   resta stabile anche se cambia l'ordine di enumerazione USB.
 - Ogni telecamera pubblica su topic distinti: `parco/<device_id>/camera` e
   `parco/<device_id>/heartbeat`, con snapshot/clip a nome del proprio `device_id`.
-- I modelli NPU (detect + pose) sono **condivisi** tra le due pipeline e
-  serializzati con lock, per non saturare i core NPU del RK3588.
+- Ogni pipeline ha i propri modelli NPU (pose, detect, armi), ciascuno fissato
+  su un core del RK3588 tramite `NPU_CORES` in `config.py`: la pose (la più
+  pesante) ha un core per telecamera, detect e armi condividono il terzo.
+  Ogni 300 frame il log riporta FPS e tempi NPU medi per modello, per
+  verificare il bilanciamento.
 - La finestra mostra le **due telecamere affiancate**, ciascuna con HUD, etichetta
   di zona e indicatore FPS.
 
