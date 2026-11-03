@@ -30,6 +30,7 @@ WEAPON_RKNN_PATH = getattr(config, "WEAPON_RKNN_PATH", "weapon_threat.rknn")
 WEAPON_CLASS_MAP = getattr(config, "WEAPON_CLASS_MAP", {})
 ALERT_MIN_CONF = getattr(config, "ALERT_MIN_CONF", 0.90)
 RKNN_TARGET = getattr(config, "RKNN_TARGET", "rk3588")
+NPU_INPUT_SIZE = tuple(getattr(config, "NPU_INPUT_SIZE", (640, 640)))
 
 
 def cleanup_old_files(directory: str, max_files: int):
@@ -330,8 +331,10 @@ class CameraPipeline(threading.Thread):
         layouts = getattr(config, "NPU_CORES", [])
         cores = layouts[index] if index < len(layouts) else {}
         logger.info(f"[{self.zone}] Caricamento modelli NPU dedicati (core: {cores or 'auto'})...")
-        self.detect_model = DetectModel(DETECT_RKNN_PATH, core_mask=core_mask_from(cores.get("detect")), conf_thresh=config.CONF_THRESHOLD)
-        self.pose_model = PoseModel(POSE_RKNN_PATH, core_mask=core_mask_from(cores.get("pose")), conf_thresh=config.CONF_THRESHOLD)
+        self.detect_model = DetectModel(DETECT_RKNN_PATH, core_mask=core_mask_from(cores.get("detect")),
+                                        conf_thresh=config.CONF_THRESHOLD, input_size=NPU_INPUT_SIZE)
+        self.pose_model = PoseModel(POSE_RKNN_PATH, core_mask=core_mask_from(cores.get("pose")),
+                                    conf_thresh=config.CONF_THRESHOLD, input_size=NPU_INPUT_SIZE)
 
         # Modello armi dedicato (Gun/explosion/grenade/knife). Opzionale: se il
         # file .rknn manca la pipeline prosegue con i soli modelli COCO/pose.
@@ -345,6 +348,7 @@ class CameraPipeline(threading.Thread):
                     core_mask=core_mask_from(cores.get("weapon")),
                     conf_thresh=max(getattr(config, "WEAPON_CONF_THRESHOLD", 0.35), ALERT_MIN_CONF),
                     classes=getattr(config, "WEAPON_CLASSES", WEAPON_CLASSES),
+                    input_size=NPU_INPUT_SIZE,
                 )
             except Exception as e:
                 logger.error(f"[{self.zone}] Modello armi '{WEAPON_RKNN_PATH}' non caricato ({e}): rilevamento armi dedicato disattivato.")

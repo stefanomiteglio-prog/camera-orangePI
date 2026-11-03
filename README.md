@@ -208,3 +208,42 @@ e imposta `VLM_MODEL = "moondream"` in config.py.
 
 - L'assembramento richiede `CROWD_COUNT_THRESHOLD` persone per `CROWD_SECONDS_THRESHOLD` secondi
 - `audio_node.py` scarica al primo avvio i pesi PANNs/Whisper (qualche centinaio di MB)
+
+## Modelli NPU in INT8 (velocità)
+
+I modelli `yolov8s-pose.rknn` (26 MB) e `weapon_threat.rknn` (7,9 MB) nascono
+dall'export standard di Ultralytics, che **non quantizza**: girano in FP16,
+circa 3 volte più lenti dell'INT8 (la pose occupa ~110 ms per frame su un core).
+Lo yolov8n del model zoo è già INT8.
+
+L'export standard non si può quantizzare così com'è: mette coordinate in pixel e
+confidenze nello stesso tensore e in INT8 le confidenze perderebbero precisione.
+Per questo la conversione passa da un export **a head separata**
+(`export_onnx_split.py`) e la decodifica la fa `rknn_backend.py` su CPU.
+`rknn_backend.py` riconosce da solo il formato: i `.rknn` attuali continuano a funzionare.
+
+1. **Export ONNX** (qualsiasi PC con `pip install ultralytics onnx`, anche Windows):
+   ```bash
+   python export_onnx_split.py yolov8s-pose.pt
+   python export_onnx_split.py weapon_threat.pt
+   python export_onnx_split.py yolov8n.pt
+   ```
+   Default input 640x480 (come le telecamere: nessun bordo, ~25% di calcolo in meno).
+   Lo script stampa le classi del modello: per le armi l'ordine deve coincidere
+   con `WEAPON_CLASSES` in `config.py`.
+2. **Immagini di calibrazione**: copia dall'Orange Pi le cartelle `snapshots/` e `clips/`
+   (100-300 immagini reali, varie per luce e presenza di persone).
+3. **Conversione INT8** (Linux x86_64/aarch64 o WSL2, `pip install rknn-toolkit2 opencv-python`):
+   ```bash
+   python convert_rknn_int8.py yolov8s-pose_split.onnx --calib snapshots clips
+   python convert_rknn_int8.py weapon_threat_split.onnx --calib snapshots clips
+   python convert_rknn_int8.py yolov8n_split.onnx --calib snapshots clips
+   ```
+   Con `--analyze` confronta float e INT8 strato per strato.
+4. **Sull'Orange Pi**: copia i tre `*_split.rknn`, aggiorna `POSE_RKNN_PATH`,
+   `WEAPON_RKNN_PATH`, `DETECT_RKNN_PATH` e imposta `NPU_INPUT_SIZE = (640, 480)`
+   in `config.py`. I tre modelli vanno sostituiti insieme (stessa dimensione di input).
+5. **Verifica**: nel log `Prestazioni` la pose dovrebbe scendere a circa 30-40 ms
+   (da ~110); `sudo cat /sys/kernel/debug/rknpu/load` mostra il carico per core.
+   Controlla che armi e scheletri vengano ancora riconosciuti: se l'INT8 perde
+   precisione su un modello, rifai la calibrazione con più immagini o usa `--analyze`.

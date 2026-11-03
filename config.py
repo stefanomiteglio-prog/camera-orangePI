@@ -123,6 +123,14 @@ POSE_RKNN_PATH = "yolov8s-pose.rknn"
 DETECT_RKNN_PATH = "rknn_test/rknn_model_zoo/examples/yolov8/model/yolov8n.rknn"
 RKNN_TARGET = "rk3588"
 
+# Dimensione di input (larghezza, altezza) dei tre modelli NPU: deve essere quella
+# con cui sono stati compilati i .rknn. I modelli attuali (export Ultralytics FP16
+# e yolov8n del model zoo) sono 640x640. Dopo la conversione INT8 con
+# export_onnx_split.py + convert_rknn_int8.py (default 640x480, vedi README) usa
+# (640, 480): il frame della telecamera entra senza bordo, circa -25% di calcolo.
+# I tre modelli vanno convertiti insieme, alla stessa dimensione.
+NPU_INPUT_SIZE = (640, 640)
+
 # Core NPU del RK3588 (0, 1, 2) assegnato a ogni modello, una voce per telecamera
 # nello stesso ordine di CAMERAS. "auto" lascia la scelta al runtime RKNN, che
 # però può mettere due inferenze sullo stesso core lasciandone un altro fermo.

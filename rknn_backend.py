@@ -18,14 +18,23 @@ COCO_CLASSES = ("person","bicycle","car","motorcycle","airplane","bus","train","
     "hair drier","toothbrush")
 
 
+def input_wh(size):
+    """640 -> (640, 640); (640, 480) resta (larghezza, altezza)."""
+    return (size, size) if isinstance(size, int) else tuple(size)
+
+
 def letterbox(img, size=640, color=114):
+    tw, th = input_wh(size)
     h, w = img.shape[:2]
-    r = min(size / h, size / w)
+    # Frame grande quanto l'input (es. 640x480 su modello 640x480): nessun resize né bordo
+    if (w, h) == (tw, th):
+        return img, 1.0, 0, 0
+    r = min(th / h, tw / w)
     nh, nw = int(round(h * r)), int(round(w * r))
-    # Con 640x480 r == 1: niente resize, solo il bordo (copyMakeBorder, in C++)
+    # Con 640x480 su modello 640x640 r == 1: niente resize, solo il bordo (copyMakeBorder, in C++)
     resized = img if (nh, nw) == (h, w) else cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
-    top, left = (size - nh) // 2, (size - nw) // 2
-    canvas = cv2.copyMakeBorder(resized, top, size - nh - top, left, size - nw - left,
+    top, left = (th - nh) // 2, (tw - nw) // 2
+    canvas = cv2.copyMakeBorder(resized, top, th - nh - top, left, tw - nw - left,
                                 cv2.BORDER_CONSTANT, value=(color, color, color))
     return canvas, r, left, top
 
@@ -36,6 +45,7 @@ def preprocess(frame, size=640):
     Calcolato UNA volta per frame e condiviso da tutti i modelli con lo stesso input_size;
     la conversione colore è fatta sul frame originale (più piccolo del 640x640).
     """
+    size = input_wh(size)
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     img, ratio, dx, dy = letterbox(rgb, size)
     return np.expand_dims(img, axis=0), ratio, dx, dy, size
@@ -86,7 +96,7 @@ class _RknnModel:
         self.rknn = _make_rknnlite(model_path, core_mask)
         self.conf_thresh = conf_thresh
         self.nms_thresh = nms_thresh
-        self.input_size = input_size
+        self.input_size = input_wh(input_size)   # (larghezza, altezza)
         self.npu_ms = 0.0   # media mobile del solo tempo NPU (senza pre/post-processing)
 
     def _run(self, frame, prep):
@@ -108,6 +118,9 @@ class PoseModel(_RknnModel):
 
     def infer(self, frame, prep=None):
         outputs, ratio, dx, dy = self._run(frame, prep)
+        if len(outputs) > 1:
+            return self._infer_split(outputs, ratio, dx, dy)
+        # Export Ultralytics standard (FP16): output unico gia' decodificato
         o = outputs[0][0]                       # (56, 8400)
         # Filtro sulla confidenza PRIMA della trasposizione: si copiano solo le colonne valide
         idx = np.nonzero(o[4] >= self.conf_thresh)[0]
@@ -121,6 +134,43 @@ class PoseModel(_RknnModel):
         kpts = out[:,5:].reshape(-1,17,3)
         keep = _nms(boxes, scores, self.nms_thresh)
         for i in keep:
+            b = boxes[i]
+            x1 = (b[0]-dx)/ratio; y1=(b[1]-dy)/ratio; x2=(b[2]-dx)/ratio; y2=(b[3]-dy)/ratio
+            kp = kpts[i].copy()
+            kp[:,0] = (kp[:,0]-dx)/ratio
+            kp[:,1] = (kp[:,1]-dy)/ratio
+            results.append({"box":[x1,y1,x2,y2], "score": float(scores[i]), "keypoints": kp})
+        return results
+
+    def _infer_split(self, outputs, ratio, dx, dy):
+        """
+        Head separata INT8 (export_onnx_split.py): per ramo box (1,64,h,w),
+        cls (1,1,h,w) e keypoint grezzi (1,51,h,w), decodificati solo sulle celle candidate.
+        """
+        parts = []
+        for i in range(len(outputs) // 3):
+            reg, cls, kpt = outputs[3*i:3*i+3]
+            part = _decode_branch(reg, cls, self.input_size[1], self.conf_thresh)
+            if part is None:
+                continue
+            boxes, scores, _, idx = part
+            gh, gw = kpt.shape[2:]
+            stride = self.input_size[1] / gh
+            k = kpt[0].reshape(17, 3, gh * gw)[:, :, idx]            # (17, 3, k)
+            col = (idx % gw).astype(np.float32)
+            row = (idx // gw).astype(np.float32)
+            # Come Ultralytics: (offset*2 + ancora - 0.5) * stride, con ancora = cella + 0.5
+            kx = (k[:, 0] * 2.0 + col) * stride
+            ky = (k[:, 1] * 2.0 + row) * stride
+            kv = 1.0 / (1.0 + np.exp(-k[:, 2]))
+            parts.append((boxes, scores, np.stack([kx, ky, kv], axis=-1).transpose(1, 0, 2)))
+        results = []
+        if not parts:
+            return results
+        boxes = np.concatenate([p[0] for p in parts])
+        scores = np.concatenate([p[1] for p in parts])
+        kpts = np.concatenate([p[2] for p in parts])
+        for i in _nms(boxes, scores, self.nms_thresh):
             b = boxes[i]
             x1 = (b[0]-dx)/ratio; y1=(b[1]-dy)/ratio; x2=(b[2]-dx)/ratio; y2=(b[3]-dy)/ratio
             kp = kpts[i].copy()
@@ -144,6 +194,11 @@ class WeaponModel(_RknnModel):
 
     def infer(self, frame, prep=None):
         outputs, ratio, dx, dy = self._run(frame, prep)
+        if len(outputs) > 1:
+            # Head separata INT8 (export_onnx_split.py): stessa decodifica del detector COCO
+            return _decode_detect(outputs, self.input_size[1], self.conf_thresh, self.nms_thresh,
+                                  self.classes, ratio, dx, dy)
+        # Export Ultralytics standard (FP16): output unico gia' decodificato
         o = outputs[0][0]                       # (4+nc, 8400)
         class_scores = o[4:4 + len(self.classes)]
         scores = class_scores.max(axis=0)
@@ -162,9 +217,10 @@ class WeaponModel(_RknnModel):
         return results
 
 
-def _decode_branch(reg, cls, img_size, conf_thresh):
+def _decode_branch(reg, cls, input_h, conf_thresh):
     """
-    Un ramo della head YOLOv8 (rknn_model_zoo): reg (1,4*16,h,w) in formato DFL, cls (1,nc,h,w).
+    Un ramo della head YOLOv8 (rknn_model_zoo o export_onnx_split.py): reg (1,4*16,h,w)
+    in formato DFL, cls (1,nc,h,w) gia' passato per la sigmoide.
     Soglia sulle classi PRIMA della DFL: softmax solo sulle celle candidate invece
     che su tutte le 8400 (la parte più costosa del post-processing su CPU).
     """
@@ -181,9 +237,33 @@ def _decode_branch(reg, cls, img_size, conf_thresh):
     d = (e * acc).sum(axis=1) / e.sum(axis=1)                       # (4, k)
     col = (idx % gw).astype(np.float32) + 0.5
     row = (idx // gw).astype(np.float32) + 0.5
-    stride = img_size / gh
+    stride = input_h / gh
     boxes = np.stack([col - d[0], row - d[1], col + d[2], row + d[3]], axis=1) * stride
-    return boxes, cmax[idx], c[:, idx].argmax(axis=0)
+    return boxes, cmax[idx], c[:, idx].argmax(axis=0), idx
+
+
+def _decode_detect(outputs, input_h, conf_thresh, nms_thresh, class_names, ratio, dx, dy):
+    """
+    Output a rami: 3 per ramo nel model zoo (box DFL, classi, score_sum ignorato),
+    2 per ramo con export_onnx_split.py (box DFL, classi).
+    """
+    per_branch = len(outputs) // 3
+    parts = [_decode_branch(outputs[per_branch*i], outputs[per_branch*i+1], input_h, conf_thresh)
+             for i in range(3)]
+    parts = [p for p in parts if p is not None]
+    results = []
+    if not parts:
+        return results
+    boxes = np.concatenate([p[0] for p in parts])
+    scores = np.concatenate([p[1] for p in parts])
+    classes = np.concatenate([p[2] for p in parts])
+    keep = _nms(boxes, scores, nms_thresh, class_ids=classes)
+    for k in keep:
+        x1,y1,x2,y2 = boxes[k]
+        x1=(x1-dx)/ratio; y1=(y1-dy)/ratio; x2=(x2-dx)/ratio; y2=(y2-dy)/ratio
+        c = int(classes[k])
+        results.append({"box":[x1,y1,x2,y2], "score": float(scores[k]), "class_id": c, "class_name": class_names[c]})
+    return results
 
 
 class DetectModel(_RknnModel):
@@ -193,24 +273,8 @@ class DetectModel(_RknnModel):
 
     def infer(self, frame, prep=None):
         outputs, ratio, dx, dy = self._run(frame, prep)
-        # Model zoo: 3 output per ramo (box DFL, classi, score_sum), 3 rami
-        per_branch = len(outputs) // 3
-        parts = [_decode_branch(outputs[per_branch*i], outputs[per_branch*i+1], self.input_size, self.conf_thresh)
-                 for i in range(3)]
-        parts = [p for p in parts if p is not None]
-        results = []
-        if not parts:
-            return results
-        boxes = np.concatenate([p[0] for p in parts])
-        scores = np.concatenate([p[1] for p in parts])
-        classes = np.concatenate([p[2] for p in parts])
-        keep = _nms(boxes, scores, self.nms_thresh, class_ids=classes)
-        for k in keep:
-            x1,y1,x2,y2 = boxes[k]
-            x1=(x1-dx)/ratio; y1=(y1-dy)/ratio; x2=(x2-dx)/ratio; y2=(y2-dy)/ratio
-            c = int(classes[k])
-            results.append({"box":[x1,y1,x2,y2], "score": float(scores[k]), "class_id": c, "class_name": self.classes[c]})
-        return results
+        return _decode_detect(outputs, self.input_size[1], self.conf_thresh, self.nms_thresh,
+                              self.classes, ratio, dx, dy)
 
 
 class SimpleTracker:
