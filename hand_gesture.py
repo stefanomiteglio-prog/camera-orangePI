@@ -1,125 +1,117 @@
-import math
-import time
+"""
+Riconoscimento del gesto di aiuto ("Signal for Help"): stesso metodo del
+vecchio progetto Telecamera (riconoscimento_mano_definitivo.py), che lì
+funzionava bene.
 
-import cv2
-import mediapipe as mp
+  - MediaPipe Hands, una mano, confidenza 0.7, modello completo;
+  - immagine specchiata come in fase di registrazione del dataset: la
+    specchiatura è applicata alle coordinate (x -> -x), equivalente a
+    cv2.flip(frame, 1) senza copiare l'immagine;
+  - per ogni frame 21 landmark come (x - x_polso, y - y_polso);
+  - sequenza degli ultimi 15 frame con la mano -> RandomForest (630 feature);
+  - allarme quando la predizione "aiuto" esce per più di 3 volte di fila.
+
+Il modello viene da train_gesture_classifier.py (dataset gesture_dataset/dataset_seq.csv).
+"""
+import os
+import pickle
+import time
+from collections import deque
+
+import numpy as np
 
 import config
 
-mp_hands = mp.solutions.hands
-mp_draw = mp.solutions.drawing_utils
-mp_styles = mp.solutions.drawing_styles
 
-
-def _hand_diag(landmarks) -> float:
-    xs = [p.x for p in landmarks]
-    ys = [p.y for p in landmarks]
-    return math.hypot(max(xs) - min(xs), max(ys) - min(ys)) or 1.0
-
-
-def _is_open_palm(landmarks, diag) -> bool:
-    tips = [8, 12, 16, 20]
-    mcps = [5, 9, 13, 17]
-    extended = 0
-    for tip, mcp in zip(tips, mcps):
-        dist = math.hypot(landmarks[tip].x - landmarks[0].x, landmarks[tip].y - landmarks[0].y)
-        mcp_dist = math.hypot(landmarks[mcp].x - landmarks[0].x, landmarks[mcp].y - landmarks[0].y)
-        if dist > mcp_dist * 1.15:
-            extended += 1
-    return extended >= 3
-
-
-def _is_thumb_tucked_fist(landmarks, diag) -> bool:
-    tips = [8, 12, 16, 20]
-    mcps = [5, 9, 13, 17]
-    folded = 0
-    for tip, mcp in zip(tips, mcps):
-        dist = math.hypot(landmarks[tip].x - landmarks[0].x, landmarks[tip].y - landmarks[0].y)
-        mcp_dist = math.hypot(landmarks[mcp].x - landmarks[0].x, landmarks[mcp].y - landmarks[0].y)
-        if dist < mcp_dist * 1.05:
-            folded += 1
-
-    thumb_tip = landmarks[4]
-    palm = landmarks[9]
-    thumb_dist_ratio = math.hypot(thumb_tip.x - palm.x, thumb_tip.y - palm.y) / diag
-
-    return folded >= 3 and thumb_dist_ratio < config.HELP_GESTURE_TUCK_RATIO
+def landmarks_to_frame(landmarks, mirror=True):
+    """Landmark MediaPipe -> 42 valori (x - x_polso, y - y_polso), come nel dataset."""
+    pts = np.array([(p.x, p.y) for p in landmarks], dtype=np.float32)
+    pts -= pts[0]
+    if mirror:
+        pts[:, 0] = -pts[:, 0]
+    return pts.reshape(-1)
 
 
 class HelpGestureDetector:
     """
-    Rilevatore del "Signal for Help" con stato e istanza MediaPipe Hands PROPRI.
-
-    Ogni telecamera deve avere il suo detector: lo stato del gesto (palmo aperto →
-    pugno col pollice ripiegato) e il grafo MediaPipe non sono condivisibili tra
-    più stream senza falsare i rilevamenti.
+    Stato e istanza MediaPipe Hands PROPRI: ogni telecamera deve avere il suo
+    detector (sequenza di landmark e grafo MediaPipe non sono condivisibili).
     """
 
-    def __init__(self):
-        self.hands = mp_hands.Hands(
-            max_num_hands=2,
-            model_complexity=getattr(config, "HANDS_MODEL_COMPLEXITY", 0),
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
+    def __init__(self, model_path=None):
+        import mediapipe as mp
+
+        self._mp_hands = mp.solutions.hands
+        self._mp_draw = mp.solutions.drawing_utils
+        conf = getattr(config, "HELP_GESTURE_HAND_CONFIDENCE", 0.7)
+        self.hands = self._mp_hands.Hands(
+            max_num_hands=1,
+            model_complexity=getattr(config, "HANDS_MODEL_COMPLEXITY", 1),
+            min_detection_confidence=conf,
+            min_tracking_confidence=conf,
         )
-        self._state = {"open_since": None, "open_seen_at": None, "tucked_since": None}
+        path = model_path or getattr(config, "HELP_GESTURE_MODEL_PATH", "gesture_model.pkl")
+        if not os.path.isabs(path):
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        self.model = data["model"]
+        self.model.n_jobs = 1   # predizione singola: i thread costano più del calcolo
+        self._aiuto_idx = list(self.model.classes_).index("aiuto")
+        self.seq_len = data.get("sequence_length", getattr(config, "HELP_GESTURE_SEQUENCE_LENGTH", 15))
+
+        self.mirror = getattr(config, "HELP_GESTURE_MIRROR", True)
+        self.needed = getattr(config, "HELP_GESTURE_CONSECUTIVE", 4)
+        self.reset_s = getattr(config, "HELP_GESTURE_RESET_SECONDS", 2.0)
+
+        self._seq = deque(maxlen=self.seq_len)
+        self._last_hand_t = 0.0
+        self._probs = []            # probabilità "aiuto" delle predizioni consecutive
+        self.last_confidence = 0.0  # media delle probabilità che hanno generato l'ultimo allarme
+
+    def _reset(self):
+        self._seq.clear()
+        self._probs = []
 
     def progress(self) -> float:
-        if self._state["tucked_since"] is None:
-            return 0.0
-        elapsed = time.time() - self._state["tucked_since"]
-        return min(1.0, elapsed / config.HELP_GESTURE_TUCKED_HOLD_SECONDS)
+        return min(1.0, len(self._probs) / self.needed) if self.needed > 0 else 0.0
 
     def idle(self):
-        """Nessuna persona in scena: stesso effetto di un frame senza mani, senza eseguire MediaPipe."""
-        self._state["tucked_since"] = None
-        self._state["open_since"] = None
+        """Nessuna persona in scena: si azzera la sequenza senza eseguire MediaPipe."""
+        self._reset()
 
     def detect(self, frame, draw=True) -> bool:
-        """
-        Rileva il "Signal for Help": palmo aperto seguito, entro pochi secondi,
-        da un pugno chiuso col pollice ripiegato dentro il palmo.
-        Soglie basate sul tempo reale (secondi), non su conteggio frame,
-        così funzionano a qualsiasi framerate della pipeline.
-        Con draw=True disegna gli skeleton delle mani sul frame passato (in-place).
-        """
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = self.hands.process(rgb)
+        import cv2
+
+        now = time.time()
+        result = self.hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         if not result.multi_hand_landmarks:
-            self.idle()
+            # Come nel vecchio progetto la sequenza sopravvive a brevi perdite
+            # della mano; dopo reset_s senza mano riparte da zero.
+            if now - self._last_hand_t > self.reset_s:
+                self._reset()
             return False
 
-        triggered = False
-        now = time.time()
+        hand = result.multi_hand_landmarks[0]
+        if draw:
+            self._mp_draw.draw_landmarks(frame, hand, self._mp_hands.HAND_CONNECTIONS)
+        if now - self._last_hand_t > self.reset_s:
+            self._reset()
+        self._last_hand_t = now
+        self._seq.append(landmarks_to_frame(hand.landmark, self.mirror))
+        if len(self._seq) < self.seq_len:
+            return False
 
-        for hand_landmarks in result.multi_hand_landmarks:
-            if draw:
-                mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-            lm = hand_landmarks.landmark
-            diag = _hand_diag(lm)
-
-            if _is_open_palm(lm, diag):
-                if self._state["open_since"] is None:
-                    self._state["open_since"] = now
-                if now - self._state["open_since"] >= config.HELP_GESTURE_OPEN_HOLD_SECONDS:
-                    self._state["open_seen_at"] = now
-                self._state["tucked_since"] = None
-
-            elif _is_thumb_tucked_fist(lm, diag):
-                self._state["open_since"] = None
-                open_at = self._state["open_seen_at"]
-                if open_at is not None and now - open_at <= config.HELP_GESTURE_WINDOW_SECONDS:
-                    if self._state["tucked_since"] is None:
-                        self._state["tucked_since"] = now
-                    if now - self._state["tucked_since"] >= config.HELP_GESTURE_TUCKED_HOLD_SECONDS:
-                        triggered = True
-                        self._state["open_seen_at"] = None
-                        self._state["tucked_since"] = None
-            else:
-                self._state["open_since"] = None
-                self._state["tucked_since"] = None
-
-        return triggered
+        probs = self.model.predict_proba(np.concatenate(self._seq).reshape(1, -1))[0]
+        if int(np.argmax(probs)) != self._aiuto_idx:
+            self._probs = []
+            return False
+        self._probs.append(float(probs[self._aiuto_idx]))
+        if len(self._probs) >= self.needed:
+            self.last_confidence = sum(self._probs) / len(self._probs)
+            self._reset()
+            return True
+        return False
 
     def close(self):
         try:
@@ -128,10 +120,7 @@ class HelpGestureDetector:
             pass
 
 
-# ============================================================
-# Compatibilità con codice legacy (singola telecamera):
-# main_pc_backup.py e altri usano le funzioni a livello di modulo.
-# ============================================================
+# Compatibilità con codice legacy a singola telecamera (main_pc_backup.py)
 _default_detector = None
 
 
