@@ -14,6 +14,10 @@ nel backend TreeEyes.
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
+# Frame elaborati al secondo per telecamera (le telecamere USB ignorano CAMERA_FPS
+# sotto 30): i frame in eccesso vengono scartati prima di qualsiasi elaborazione.
+# Con le cadenze sotto, 20 = ~10 pose e ~7 detect/armi al secondo. 0 = nessun limite.
+PROCESS_MAX_FPS = 20
 
 # Controlli V4L2 applicati all'apertura con v4l2-ctl (sudo apt install v4l-utils).
 # In poca luce le webcam UVC allungano l'esposizione e calano gli FPS: il
@@ -30,14 +34,21 @@ CAMERA_V4L2_CONTROLS = {
 
 # --- Cadenza inferenze (1 = ogni frame, 2 = un frame sì e uno no, ...) ----
 # Alzare questi valori aumenta gli FPS a scapito della reattività del rilevatore.
-POSE_PROCESS_EVERY = 1     # stima pose/scheletro
-DETECT_PROCESS_EVERY = 2   # detection oggetti COCO (persone/bastone/coltello)
-WEAPON_PROCESS_EVERY = 2   # detection armi (weapon_threat.rknn), sfalsata di un frame rispetto a COCO
+POSE_PROCESS_EVERY = 2     # stima pose/scheletro (serve a tracking, scheletro e presenze; il gesto lo fa MediaPipe)
+DETECT_PROCESS_EVERY = 3   # detection oggetti COCO (persone/bastone/coltello)
+WEAPON_PROCESS_EVERY = 3   # detection armi (weapon_threat.rknn), sfalsata di un frame rispetto a COCO
 HANDS_PROCESS_EVERY = 1    # gesto aiuto: ogni frame, come nel vecchio progetto (la sequenza è di 15 frame consecutivi)
 # Pipeline a un frame: le inferenze NPU/MediaPipe del frame N girano mentre la
 # CPU elabora il frame N con i risultati del frame N-1 (circa 50-60 ms di
-# ritardo). Con la pose INT8 a ~45 ms porta da ~15 a ~20 FPS per telecamera.
+# ritardo): il tempo per frame diventa max(NPU, CPU) invece della somma.
 PIPELINE_INFERENCE = True
+# Modalità riposo: se nessun modello vede persone da IDLE_AFTER_SECONDS, pose,
+# detect e armi girano solo ogni IDLE_PROCESS_EVERY frame (sfalsati, mai insieme).
+# Alla prima persona vista si torna subito alle cadenze sopra. I risultati
+# restano validi tra un'inferenza e l'altra, quindi la conferma armi a finestra
+# mobile (DANGER_WINDOW_*) continua a funzionare anche senza persone.
+IDLE_AFTER_SECONDS = 5.0
+IDLE_PROCESS_EVERY = 6
 # MediaPipe gira sulla CPU: senza persone viste dal modello pose (NPU) è inutile
 # cercare mani, e si salta del tutto.
 HANDS_ONLY_WITH_PERSON = False   # una mano vicina alla telecamera spesso non è vista come persona
@@ -151,11 +162,10 @@ DETECT_RKNN_PATH = "rknn_test/rknn_model_zoo/examples/yolov8/model/yolov8n.rknn"
 RKNN_TARGET = "rk3588"
 
 # Dimensione di input (larghezza, altezza) dei tre modelli NPU: deve essere quella
-# con cui sono stati compilati i .rknn. I modelli attuali (export Ultralytics FP16
-# e yolov8n del model zoo) sono 640x640. Dopo la conversione INT8 con
-# export_onnx_split.py + convert_rknn_int8.py (default 640x480, vedi README) usa
-# (640, 480): il frame della telecamera entra senza bordo, circa -25% di calcolo.
-# I tre modelli vanno convertiti insieme, alla stessa dimensione.
+# con cui sono stati compilati i .rknn. Tutti i modelli attuali (pose e armi INT8
+# *_split640.rknn, yolov8n del model zoo) sono 640x640. NON passare a (640, 480):
+# i modelli sono addestrati su immagini 640x640 con bordo grigio e senza bordo il
+# modello armi perde le esplosioni anche in FP16 (vedi README).
 NPU_INPUT_SIZE = (640, 640)
 
 # Core NPU del RK3588 (0, 1, 2) assegnato a ogni modello, una voce per telecamera
