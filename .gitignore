@@ -31,6 +31,7 @@ datasets/
 weapon_samples/
 runs/
 *_calib/
+calib/
 *.onnx
 
 # Archivi di export
