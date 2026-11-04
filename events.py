@@ -365,7 +365,7 @@ def publish_event(
     dev = device_id or config.DEVICE_ID
 
     # Nessuna segnalazione sotto la confidenza minima, da qualunque punto arrivi
-    min_conf = getattr(config, "ALERT_MIN_CONF", 0.90)
+    min_conf = getattr(config, "ALERT_MIN_CONF", 0.30)
     if float(confidence) <= min_conf:
         logger.info(f"Allarme {danger_type} ({dev}) scartato: conf={float(confidence):.2f} <= {min_conf:.2f}")
         return False

@@ -12,6 +12,15 @@ con e senza persone).
 
     python convert_rknn_int8.py yolov8s-pose_split.onnx --calib snapshots clips
     -> yolov8s-pose_split.rknn (da copiare sull'Orange Pi)
+
+Per il modello armi la calibrazione DEVE contenere armi: snapshots/ e clips/
+di solito non ne hanno, e le attivazioni tipiche del coltello finirebbero fuori
+scala (il modello INT8 "perde" proprio la classe che serve). Aggiungi le
+immagini del dataset:
+    python convert_rknn_int8.py weapon_knife_split.onnx \\
+        --calib datasets/weapon_knife/images/val snapshots clips
+Se anche così l'INT8 perde precisione (verifica con --analyze), --fp16 produce
+un modello non quantizzato: più lento (~2-3x) ma con la precisione del PC.
 """
 import argparse
 import os
@@ -106,25 +115,29 @@ def main():
     ap.add_argument("--output", help="file .rknn di uscita (default: <onnx>.rknn)")
     ap.add_argument("--analyze", action="store_true",
                     help="confronta float e INT8 strato per strato sulla prima immagine (lento)")
+    ap.add_argument("--algorithm", default="mmse", choices=["normal", "mmse", "kl_divergence"],
+                    help="algoritmo di quantizzazione: mmse è più lento da convertire ma più preciso "
+                         "su oggetti piccoli/sottili (default: %(default)s)")
+    ap.add_argument("--fp16", action="store_true", help="nessuna quantizzazione (FP16): più lento, più preciso")
     args = ap.parse_args()
 
     base = args.onnx.rsplit(".", 1)[0]
-    output = args.output or base + ".rknn"
+    output = args.output or base + (".fp16.rknn" if args.fp16 else ".rknn")
     dataset_txt, images = build_dataset(args.calib, base + "_calib", args.width, args.height,
                                         args.max_images, args.frames_per_video)
 
     rknn = RKNN(verbose=False)
     # Input a runtime: RGB uint8 NHWC (rknn_backend.preprocess); la normalizzazione 0-1 la fa la NPU
     rknn.config(mean_values=[[0, 0, 0]], std_values=[[255, 255, 255]],
-                target_platform=args.target, quantized_algorithm="normal", quantized_method="channel")
+                target_platform=args.target, quantized_algorithm=args.algorithm, quantized_method="channel")
     assert rknn.load_onnx(model=args.onnx) == 0, "load_onnx fallito"
-    assert rknn.build(do_quantization=True, dataset=dataset_txt) == 0, "build INT8 fallito"
+    assert rknn.build(do_quantization=not args.fp16, dataset=dataset_txt) == 0, "build RKNN fallito"
     if args.analyze:
         rknn.accuracy_analysis(inputs=[images[0]], output_dir=base + "_analysis")
         print(f"Analisi precisione in {base}_analysis/error_analysis.txt")
     assert rknn.export_rknn(output) == 0, "export_rknn fallito"
     rknn.release()
-    print(f"RKNN INT8 salvato: {output} ({os.path.getsize(output) / 1e6:.1f} MB)")
+    print(f"RKNN {'FP16' if args.fp16 else 'INT8'} salvato: {output} ({os.path.getsize(output) / 1e6:.1f} MB)")
 
 
 if __name__ == "__main__":

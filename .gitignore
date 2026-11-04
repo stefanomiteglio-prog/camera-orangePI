@@ -25,3 +25,13 @@ gesture_classifier.pkl
 
 # Configurazione locale: mantieni questa riga solo se config.py contiene segreti o impostazioni personali
 # config.py
+
+# Dataset, campioni e run di addestramento del modello armi
+datasets/
+weapon_samples/
+runs/
+*_calib/
+*.onnx
+
+# Archivi di export
+*.zip
