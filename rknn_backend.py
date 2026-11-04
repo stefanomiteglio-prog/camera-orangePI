@@ -185,31 +185,41 @@ WEAPON_CLASSES = ("Gun", "explosion", "grenade", "knife")
 
 class WeaponModel(_RknnModel):
     """
-    Modello armi/minacce (weapon_threat.rknn): head YOLOv8 a output singolo
-    (1, 4+num_classi, 8400) con box cx,cy,w,h e score per classe gia' decodificati.
+    Modello armi/minacce: head YOLOv8 a output singolo (1, 4+num_classi, 8400)
+    con box cx,cy,w,h e score per classe gia' decodificati (export FP16), oppure
+    head separata INT8 (export_onnx_split.py).
+
+    active_classes: nomi delle classi da considerare. Le altre vengono escluse
+    PRIMA dell'argmax, così una classe disattivata (es. "explosion") non può
+    "rubare" una cella a un coltello.
     """
-    def __init__(self, model_path, core_mask=RKNNLite.NPU_CORE_2, conf_thresh=0.35, nms_thresh=0.45, input_size=640, classes=WEAPON_CLASSES):
+    def __init__(self, model_path, core_mask=RKNNLite.NPU_CORE_2, conf_thresh=0.35, nms_thresh=0.45, input_size=640,
+                 classes=WEAPON_CLASSES, active_classes=None):
         super().__init__(model_path, core_mask, conf_thresh, nms_thresh, input_size)
         self.classes = tuple(classes)
+        names = self.classes if active_classes is None else [c for c in self.classes if c in set(active_classes)]
+        self.active = np.array([self.classes.index(c) for c in names], dtype=np.int64)
 
     def infer(self, frame, prep=None):
         outputs, ratio, dx, dy = self._run(frame, prep)
+        if len(self.active) == 0:
+            return []
         if len(outputs) > 1:
             # Head separata INT8 (export_onnx_split.py): stessa decodifica del detector COCO
             return _decode_detect(outputs, self.input_size[1], self.conf_thresh, self.nms_thresh,
-                                  self.classes, ratio, dx, dy)
+                                  self.classes, ratio, dx, dy, active=self.active)
         # Export Ultralytics standard (FP16): output unico gia' decodificato
         o = outputs[0][0]                       # (4+nc, 8400)
-        class_scores = o[4:4 + len(self.classes)]
+        class_scores = o[4 + self.active]
         scores = class_scores.max(axis=0)
         idx = np.nonzero(scores >= self.conf_thresh)[0]
         results = []
         if len(idx) == 0:
             return results
-        cls_ids = class_scores[:, idx].argmax(axis=0); scores = scores[idx]
+        cls_ids = self.active[class_scores[:, idx].argmax(axis=0)]; scores = scores[idx]
         cx, cy, w, h = o[0, idx], o[1, idx], o[2, idx], o[3, idx]
         boxes = np.stack([cx-w/2, cy-h/2, cx+w/2, cy+h/2], axis=1)
-        keep = _nms(boxes, scores, self.nms_thresh)
+        keep = _nms(boxes, scores, self.nms_thresh, class_ids=cls_ids)
         for i in keep:
             b = boxes[i]
             x1 = (b[0]-dx)/ratio; y1=(b[1]-dy)/ratio; x2=(b[2]-dx)/ratio; y2=(b[3]-dy)/ratio
@@ -217,15 +227,18 @@ class WeaponModel(_RknnModel):
         return results
 
 
-def _decode_branch(reg, cls, input_h, conf_thresh):
+def _decode_branch(reg, cls, input_h, conf_thresh, active=None):
     """
     Un ramo della head YOLOv8 (rknn_model_zoo o export_onnx_split.py): reg (1,4*16,h,w)
     in formato DFL, cls (1,nc,h,w) gia' passato per la sigmoide.
     Soglia sulle classi PRIMA della DFL: softmax solo sulle celle candidate invece
     che su tutte le 8400 (la parte più costosa del post-processing su CPU).
+    active: indici delle sole classi da considerare (None = tutte).
     """
     _, nc, gh, gw = cls.shape
     c = cls[0].reshape(nc, gh * gw)
+    if active is not None:
+        c = c[active]
     cmax = c.max(axis=0)
     idx = np.nonzero(cmax >= conf_thresh)[0]
     if len(idx) == 0:
@@ -239,16 +252,19 @@ def _decode_branch(reg, cls, input_h, conf_thresh):
     row = (idx // gw).astype(np.float32) + 0.5
     stride = input_h / gh
     boxes = np.stack([col - d[0], row - d[1], col + d[2], row + d[3]], axis=1) * stride
-    return boxes, cmax[idx], c[:, idx].argmax(axis=0), idx
+    cls_ids = c[:, idx].argmax(axis=0)
+    if active is not None:
+        cls_ids = active[cls_ids]
+    return boxes, cmax[idx], cls_ids, idx
 
 
-def _decode_detect(outputs, input_h, conf_thresh, nms_thresh, class_names, ratio, dx, dy):
+def _decode_detect(outputs, input_h, conf_thresh, nms_thresh, class_names, ratio, dx, dy, active=None):
     """
     Output a rami: 3 per ramo nel model zoo (box DFL, classi, score_sum ignorato),
     2 per ramo con export_onnx_split.py (box DFL, classi).
     """
     per_branch = len(outputs) // 3
-    parts = [_decode_branch(outputs[per_branch*i], outputs[per_branch*i+1], input_h, conf_thresh)
+    parts = [_decode_branch(outputs[per_branch*i], outputs[per_branch*i+1], input_h, conf_thresh, active)
              for i in range(3)]
     parts = [p for p in parts if p is not None]
     results = []

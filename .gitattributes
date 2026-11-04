@@ -1,0 +1,21 @@
+# Fine riga LF nel repository per tutti (Windows, Linux, Orange Pi):
+# evita diff "tutto il file cambiato" e script che non partono sul Pi.
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.sh    text eol=lf
+
+# Binari (modelli, immagini, video): mai convertiti
+*.rknn  binary
+*.pt    binary
+*.onnx  binary
+*.pkl   binary
+*.jpg   binary
+*.jpeg  binary
+*.png   binary
+*.mp4   binary
+*.zip   binary

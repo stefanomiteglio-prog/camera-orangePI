@@ -201,6 +201,10 @@ Setup:
 Se Ollama non è raggiungibile, il sistema passa gli eventi comunque
 (fail-open, non blocca la demo) e lo segnala nei log.
 
+**Sull'Orange Pi è disattivata** (`VLM_ENABLED = False`): llava:7b sulla CPU del
+RK3588 va in timeout o, guardando il frame intero, scarta coltelli veri. Per
+usarla punta `VLM_ENDPOINT` a un Ollama sul server con GPU.
+
 Se `llava:7b` è troppo lento in demo, prova un modello più leggero: `ollama pull moondream`
 e imposta `VLM_MODEL = "moondream"` in config.py.
 
@@ -271,3 +275,104 @@ successivo. Per contenere il carico (`config.py`):
   "Modalità riposo attiva/disattivata" e la riga `Prestazioni` mostra "(riposo)".
 
 Gli FPS del log e dell'HUD sono la media degli intervalli tra frame elaborati.
+
+## Rilevamento coltelli e armi
+
+Due modelli lavorano insieme e sommano le prove nello stesso `alert_type`
+(`coltello`): il modello armi dedicato (`WEAPON_RKNN_PATH`) e la classe `knife`
+del detector COCO, addestrata proprio sui coltelli da cucina e quindi affidabile
+a distanza ravvicinata (≤ 1-2 m).
+
+Come decide (`main.py` + `danger_logic.py`):
+
+1. **Soglia per classe** (`WEAPON_CLASS_THRESHOLDS`, `COCO_DANGER_THRESHOLDS`):
+   coltello 0.40 (modello armi) e 0.35 (COCO). Le classi non elencate, come
+   `explosion` e `grenade`, sono escluse già prima dell'argmax.
+2. **Bonus mano**: se il box è vicino a un polso rilevato dal modello pose, la
+   soglia scende di `DANGER_HAND_BONUS` (0.10). Con `DANGER_REQUIRE_HAND = True`
+   contano solo gli oggetti in mano (consigliato quando le persone sono
+   inquadrate per intero).
+3. **Conferma a finestra mobile**: nelle ultime `DANGER_WINDOW_SECONDS` (2 s)
+   il coltello deve essere visto per almeno `DANGER_CONFIRM_SECONDS` (1 s), in
+   almeno `DANGER_MIN_HITS` frame e nel `DANGER_MIN_RATIO` (50%) dei frame. Una
+   lama che sparisce per qualche frame non azzera la conferma, mentre un falso
+   positivo isolato non arriva mai a far scattare l'allarme. La confidenza
+   inviata via MQTT è la media della finestra.
+4. `ALERT_MIN_CONF` (0.30) resta solo come rete di sicurezza in `publish_event`.
+
+L'HUD mostra "Arma: coltello 65%", cioè quanto manca alla conferma. Sul box
+compare "mano" quando l'oggetto è vicino a un polso.
+
+**Taratura**: se i coltelli veri non scattano, abbassa di 0.05 la soglia della
+classe. Se scattano falsi allarmi, alzala oppure attiva `DANGER_REQUIRE_HAND`.
+
+**Telecamere**: `CAMERA_V4L2_CONTROLS` disattiva la "priorità esposizione"
+(framerate fisso anche con poca luce, meno sfocatura). Serve `sudo apt install v4l-utils`.
+
+### Raccolta campioni (per il riaddestramento)
+
+Con `WEAPON_SAMPLES_ENABLED = True` ogni candidato arma con score ≥ 0.25 (al
+massimo un frame ogni 2 s per telecamera) viene salvato in `weapon_samples/`,
+con le etichette YOLO già compilate. Prima del training rivedili con CVAT,
+Roboflow o labelImg: correggi i box e **svuota il .txt dei falsi positivi**
+(diventano esempi negativi, molto utili).
+
+## Modello coltelli: dataset e addestramento
+
+`weapon_threat.rknn` (YOLOv8n, classi Gun/explosion/grenade/knife) è addestrato
+su immagini web generiche. Il nuovo modello `weapon_knife` (YOLOv8s, classi
+`knife`, `gun`) si addestra sul PC con GPU:
+
+```bash
+pip install -r requirements-train.txt      # dopo PyTorch con CUDA
+```
+
+**1. Dataset** (`prepare_weapon_dataset.py`): unisce le fonti e uniforma le classi.
+
+| Fonte | Cosa porta | Come |
+|---|---|---|
+| COCO 2017 | coltelli da cucina in contesto reale | `--coco 4000` (FiftyOne, senza account) |
+| Open Images V7 | Kitchen knife, Knife, Dagger, Handgun | `--openimages 3000` (FiftyOne, senza account) |
+| COCO hard negative | forchette, cucchiai, forbici, telefoni… senza coltelli | `--negatives 2000` |
+| [OD-WeaponDetection](https://github.com/ari-dasci/OD-WeaponDetection), Knife_detection | ~2000 immagini di coltelli da sorveglianza (CC-BY-4.0) | clona il repo, poi `--voc <cartella>` |
+| [Roboflow: knife-detection](https://universe.roboflow.com/ai-0jtbr/knife-detection-hgvy2/dataset/2) | ~9000 immagini, export YOLOv8 | `--roboflow ai-0jtbr/knife-detection-hgvy2/2` + `ROBOFLOW_API_KEY` |
+| I vostri campioni | stesse telecamere, luce e inquadratura | `--extra weapon_samples` (dopo la revisione) |
+
+Altri dataset Roboflow Universe (es. [knife](https://universe.roboflow.com/main-maege/knife-gmyes),
+[Knife_hand_holding](https://universe.roboflow.com/testing-y9g4b/knife_hand_holding)) si
+aggiungono con `--roboflow workspace/progetto/versione`: la versione si legge
+sulla pagina del dataset. Le classi composte come "holding-knife" vengono
+scartate in automatico; forza la mappatura con `--map "Nome=knife"`.
+
+Il repo OD-WeaponDetection pesa circa 2.2 GB. `--voc` cerca gli .xml in tutte le
+sottocartelle: se il nome della cartella del subset coltelli è diverso, adatta il path.
+
+```bash
+git clone --depth 1 https://github.com/ari-dasci/OD-WeaponDetection datasets/_downloads/OD-WeaponDetection
+python prepare_weapon_dataset.py --out datasets/weapon_knife --clean \
+    --coco 4000 --openimages 3000 --negatives 2000 \
+    --voc datasets/_downloads/OD-WeaponDetection/Knife_detection \
+    --roboflow ai-0jtbr/knife-detection-hgvy2/2 \
+    --extra weapon_samples
+```
+
+**2. Training** (crea `weapon_knife.pt` e `weapon_knife_split.onnx`):
+```bash
+python train_weapon_model.py --data datasets/weapon_knife/data.yaml
+```
+Stampa precision e recall per classe. `runs/weapon/weapon_knife/BoxF1_curve.png`
+indica la confidenza ottimale da usare in `WEAPON_CLASS_THRESHOLDS`.
+
+**3. Conversione RKNN** (Linux/WSL2). La calibrazione deve contenere coltelli:
+```bash
+python convert_rknn_int8.py weapon_knife_split.onnx --calib datasets/weapon_knife/images/val snapshots clips
+```
+L'algoritmo di default è `mmse`. Se l'INT8 perde precisione (`--analyze`),
+`--fp16` crea un modello non quantizzato.
+
+**4. Orange Pi**: copia `weapon_knife_split.rknn` e in `config.py` imposta
+`WEAPON_RKNN_PATH = "weapon_knife_split.rknn"`, `WEAPON_CLASSES = ["knife", "gun"]`,
+`WEAPON_CLASS_THRESHOLDS = {"knife": 0.40, "gun": 0.50}`. L'input è 640x640 come
+gli altri modelli split: `NPU_INPUT_SIZE = (640, 640)` vale per tutti.
+
+Test della logica di conferma (senza NPU): `python test_danger_logic.py`.

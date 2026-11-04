@@ -19,6 +19,19 @@ CAMERA_FPS = 30
 # Con le cadenze sotto, 20 = ~10 pose e ~7 detect/armi al secondo. 0 = nessun limite.
 PROCESS_MAX_FPS = 20
 
+# Controlli V4L2 applicati all'apertura con v4l2-ctl (sudo apt install v4l-utils).
+# In poca luce le webcam UVC allungano l'esposizione e calano gli FPS: il
+# coltello in movimento diventa una scia che nessun modello riconosce.
+# Con la "priorità esposizione" disattivata il framerate resta fisso.
+# I nomi cambiano tra kernel/telecamere (elenco: v4l2-ctl -d <dev> -L): quelli
+# non supportati vengono ignorati. Per un'esposizione manuale breve aggiungi
+# ad es. "auto_exposure": 1, "exposure_time_absolute": 150 (vecchi kernel:
+# "exposure_auto": 1, "exposure_absolute": 150) e alza "gain".
+CAMERA_V4L2_CONTROLS = {
+    "exposure_auto_priority": 0,        # kernel vecchi
+    "exposure_dynamic_framerate": 0,    # kernel >= 5.x
+}
+
 # --- Cadenza inferenze (1 = ogni frame, 2 = un frame sì e uno no, ...) ----
 # Alzare questi valori aumenta gli FPS a scapito della reattività del rilevatore.
 POSE_PROCESS_EVERY = 2     # stima pose/scheletro (serve a tracking, scheletro e presenze; il gesto lo fa MediaPipe)
@@ -159,12 +172,27 @@ WEAPON_ENABLED = True
 WEAPON_RKNN_PATH = "weapon_threat_split640.rknn"
 # Ordine delle classi = ordine di addestramento del modello: NON cambiarlo.
 WEAPON_CLASSES = ["Gun", "explosion", "grenade", "knife"]
-# Soglia dedicata: più alta di CONF_THRESHOLD perché il modello tende ai falsi
-# positivi a bassa confidenza (nel test a 0.10 riconosce "qualsiasi oggetto").
-WEAPON_CONF_THRESHOLD = 0.35
+# Nuovo modello addestrato con train_weapon_model.py (vedi README, "Modello
+# coltelli"): dopo export_onnx_split.py + convert_rknn_int8.py usa
+#   WEAPON_RKNN_PATH = "weapon_knife_split.rknn"
+#   WEAPON_CLASSES = ["knife", "gun"]
+#   WEAPON_CLASS_THRESHOLDS = {"knife": 0.40, "gun": 0.50}
+# (input 640x640 come gli altri modelli INT8: NPU_INPUT_SIZE resta (640, 640)).
+
+# Soglia di rilevamento PER CLASSE del modello armi. Solo le classi elencate
+# vengono considerate: "explosion" e "grenade" sono escluse (inutili in questo
+# scenario, generavano solo falsi positivi e "rubavano" celle al coltello).
+# Riferimento: un coltello da cucina a ~1 m dà tipicamente 0.4-0.8; la vecchia
+# soglia 0.90 scartava quasi tutti i rilevamenti veri. I falsi positivi isolati
+# li elimina la conferma a finestra mobile (DANGER_WINDOW_*), non la soglia.
+WEAPON_CLASS_THRESHOLDS = {
+    "knife": 0.40,
+    "Gun": 0.50,
+}
 # Classe del modello -> alert_type inviato al backend
 WEAPON_CLASS_MAP = {
     "Gun": "arma_da_fuoco",
+    "gun": "arma_da_fuoco",
     "explosion": "esplosione",
     "grenade": "granata",
     "knife": "coltello",
@@ -191,33 +219,68 @@ STORAGE_CLEANUP_INTERVAL_SECONDS = 1800  # ogni 30 minuti
 # Confidence minima per considerare valida una rilevazione
 CONF_THRESHOLD = 0.3
 
-# Confidenza minima di OGNI segnalazione (deve essere SUPERIORE al valore).
-# Vale per tutte le classi di pericolo (COCO, modello armi, fuoco/fumo): sotto
-# soglia la rilevazione viene ignorata, nessun riquadro e nessuna segnalazione.
-# events.publish_event scarta comunque qualsiasi allarme sotto soglia.
-ALERT_MIN_CONF = 0.90
+# Confidenza minima di qualunque allarme pubblicato via MQTT (deve essere
+# SUPERIORE al valore): ultima rete di sicurezza in events.publish_event.
+# Le soglie vere sono per classe (WEAPON_CLASS_THRESHOLDS, COCO_DANGER_THRESHOLDS).
+# Per le armi la confidenza pubblicata è la MEDIA degli score nella finestra di
+# conferma. Era 0.90: bloccava di fatto ogni rilevamento di coltello.
+ALERT_MIN_CONF = 0.30
 
 # Classi COCO gia' presenti nel modello pre-addestrato che ci interessano.
 # COCO include gia' "knife" (coltello) e "baseball bat" (bastone) di serie.
 # Fuoco/fumo NON e' una classe COCO: richiede un modello dedicato (vedi README).
 # "knife" usa lo stesso alert_type del modello armi (WEAPON_CLASS_MAP), così i
-# due modelli condividono contatore e cooldown e non generano allarmi doppi.
+# due modelli condividono conferma e cooldown e non generano allarmi doppi.
+# Il "knife" COCO è addestrato proprio su coltelli da cucina: a distanza
+# ravvicinata (<= 1-2 m) è un buon secondo parere rispetto al modello armi.
 DANGER_CLASS_MAP = {
     "knife": "coltello",
     "baseball bat": "arma",
 }
+# Soglia per classe COCO (solo le classi elencate generano allarmi)
+COCO_DANGER_THRESHOLDS = {
+    "knife": 0.35,
+    "baseball bat": 0.45,
+}
+
+# Oggetto vicino a un polso di una persona (keypoint del modello pose): la
+# soglia di quella rilevazione viene abbassata di DANGER_HAND_BONUS. Un coltello
+# in mano è molto più credibile di uno "visto" sullo sfondo.
+DANGER_HAND_BONUS = 0.10
+# Distanza massima polso-oggetto, in frazione dell'altezza della persona
+DANGER_HAND_MARGIN = 0.25
+# True = conta SOLO oggetti vicini a una mano. Riduce molto i falsi positivi,
+# ma richiede che il modello pose veda i polsi: con riprese a ~1 m che
+# inquadrano solo busto e mani la persona può non essere rilevata, quindi di
+# default è False. Attivalo se il campo inquadra le persone per intero.
+DANGER_REQUIRE_HAND = False
 
 # Numero di frame consecutivi in cui il pericolo deve essere rilevato
 # prima di generare un evento, per ridurre i falsi positivi.
 CONSECUTIVE_FRAMES_THRESHOLD = 5   # usato solo da main_pc_backup.py
 
-# Conferma a tempo (main.py): arma, arma da fuoco, coltello, granata ed esplosione
-# devono restare visibili per questi secondi prima di inviare la segnalazione.
-# Indipendente dagli FPS.
-DANGER_CONFIRM_SECONDS = 3.0
-# Il detector "sfarfalla": buchi più brevi di questa durata non azzerano il
-# conteggio dei secondi. Oltre, l'arma è considerata sparita e si riparte da zero.
-DANGER_CONFIRM_GAP_SECONDS = 0.5
+# Conferma armi a finestra mobile (main.py + danger_logic.py), indipendente
+# dagli FPS. Nella finestra degli ultimi DANGER_WINDOW_SECONDS l'arma deve:
+#   - essere vista per almeno DANGER_CONFIRM_SECONDS (dal primo all'ultimo avvistamento),
+#   - in almeno DANGER_MIN_HITS frame,
+#   - e nella frazione DANGER_MIN_RATIO dei frame dal primo avvistamento.
+# Così una lama che sparisce per qualche frame (di taglio, mano che ruota) non
+# azzera la conferma, mentre i falsi positivi isolati non arrivano mai a scattare.
+# A 17-20 FPS: 1 s di conferma = circa 9-10 frame positivi su ~18-20.
+DANGER_WINDOW_SECONDS = 2.0
+DANGER_CONFIRM_SECONDS = 1.0
+DANGER_MIN_HITS = 6
+DANGER_MIN_RATIO = 0.5
+
+# --- Raccolta campioni per il riaddestramento (sample_collector.py) -------
+# Salva frame + etichette YOLO pre-compilate quando un modello vede un'arma
+# candidata (anche sotto soglia): dopo una revisione manuale diventano dataset
+# per train_weapon_model.py (prepare_weapon_dataset.py --extra weapon_samples).
+WEAPON_SAMPLES_ENABLED = True
+WEAPON_SAMPLES_DIR = "weapon_samples"
+WEAPON_SAMPLES_MIN_CONF = 0.25
+WEAPON_SAMPLES_INTERVAL_SECONDS = 2.0    # al massimo un frame ogni N secondi per telecamera
+WEAPON_SAMPLES_MAX_COUNT = 3000          # i più vecchi vengono eliminati
 
 EVENT_COOLDOWN_SECONDS = 5
 EVENT_COOLDOWN_MAP = {
@@ -272,7 +335,12 @@ VIDEO_CLIP_POST_SECONDS = 5         # Buffer 5s dopo l'evento (3-5s da specifich
 VIDEO_CLIP_DIR = "clips"
 VIDEO_CLIP_TRIGGER_TYPES = {"arma", "arma_da_fuoco", "coltello", "granata", "esplosione", "fuoco_fumo", "segnale_aiuto", "assembramento"}
 
-VLM_ENABLED = True
+# Conferma VLM (Ollama) prima di pubblicare. DISATTIVATA sull'Orange Pi:
+# llava:7b sulla CPU del RK3588 impiega da decine di secondi a minuti, va in
+# timeout (fail-open = allarme comunque, ma in ritardo) oppure, guardando il
+# frame intero dove il coltello è piccolo, scarta allarmi veri. Per usarla
+# punta VLM_ENDPOINT a un Ollama sul server con GPU (es. http://192.168.88.10:11434/...).
+VLM_ENABLED = False
 VLM_ENDPOINT = "http://localhost:11434/api/generate"
 VLM_MODEL = "llava:7b"
 VLM_TIMEOUT_SECONDS = 60

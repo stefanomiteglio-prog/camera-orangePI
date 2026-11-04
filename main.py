@@ -1,5 +1,7 @@
 import time
 import os
+import shutil
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -19,6 +21,8 @@ from events import (
 from hand_gesture import HelpGestureDetector
 import hud
 import vlm_confirm
+from danger_logic import DangerConfirmer, near_hand, threshold_for
+from sample_collector import SampleCollector, cleanup_samples
 from video_clip import ClipRecorder
 from logger import logger
 from rknn_backend import (PoseModel, DetectModel, WeaponModel, SimpleTracker, POSE_SKELETON, WEAPON_CLASSES,
@@ -28,9 +32,23 @@ POSE_RKNN_PATH = getattr(config, "POSE_RKNN_PATH", "yolov8s-pose.rknn")
 DETECT_RKNN_PATH = getattr(config, "DETECT_RKNN_PATH", "rknn_test/rknn_model_zoo/examples/yolov8/model/yolov8n.rknn")
 WEAPON_RKNN_PATH = getattr(config, "WEAPON_RKNN_PATH", "weapon_threat.rknn")
 WEAPON_CLASS_MAP = getattr(config, "WEAPON_CLASS_MAP", {})
-ALERT_MIN_CONF = getattr(config, "ALERT_MIN_CONF", 0.90)
 RKNN_TARGET = getattr(config, "RKNN_TARGET", "rk3588")
 NPU_INPUT_SIZE = tuple(getattr(config, "NPU_INPUT_SIZE", (640, 640)))
+
+# Soglie per classe: modello armi (nome classe del modello) e detector COCO.
+# Una classe assente dal dizionario è ignorata (es. "explosion", "grenade").
+WEAPON_CLASS_THRESHOLDS = getattr(config, "WEAPON_CLASS_THRESHOLDS", {"knife": 0.40, "Gun": 0.50})
+COCO_DANGER_THRESHOLDS = getattr(config, "COCO_DANGER_THRESHOLDS", {"knife": 0.35, "baseball bat": 0.45})
+# Oggetto vicino a un polso (modello pose): soglia abbassata di questo valore
+DANGER_HAND_BONUS = getattr(config, "DANGER_HAND_BONUS", 0.10)
+DANGER_HAND_MARGIN = getattr(config, "DANGER_HAND_MARGIN", 0.25)
+# Solo oggetti vicini a una mano: elimina coltelli posati, riflessi, sfondo
+DANGER_REQUIRE_HAND = getattr(config, "DANGER_REQUIRE_HAND", False)
+
+
+def _prefilter(thresholds):
+    """Soglia minima del post-processing: la più bassa raggiungibile (con bonus mano)."""
+    return max(0.05, min(thresholds.values()) - DANGER_HAND_BONUS) if thresholds else 1.0
 
 
 def cleanup_old_files(directory: str, max_files: int):
@@ -135,6 +153,32 @@ def _release_auto_camera(path):
         _auto_claims.pop(path, None)
 
 
+def apply_v4l2_controls(source, zone):
+    """
+    Applica config.CAMERA_V4L2_CONTROLS con v4l2-ctl (solo Linux, path /dev/...).
+    Ogni controllo è indipendente: quelli non supportati dalla telecamera (i nomi
+    cambiano tra kernel e modelli) vengono ignorati.
+    """
+    controls = getattr(config, "CAMERA_V4L2_CONTROLS", {})
+    if not controls or not (isinstance(source, str) and source.startswith("/dev/")):
+        return
+    v4l2 = shutil.which("v4l2-ctl")
+    if v4l2 is None:
+        logger.warning(f"[{zone}] v4l2-ctl non trovato (sudo apt install v4l-utils): controlli telecamera non applicati.")
+        return
+    applied = []
+    for name, value in controls.items():
+        try:
+            r = subprocess.run([v4l2, "-d", source, "-c", f"{name}={value}"],
+                               capture_output=True, text=True, timeout=3)
+            if r.returncode == 0:
+                applied.append(f"{name}={value}")
+        except Exception:
+            pass
+    if applied:
+        logger.info(f"[{zone}] Controlli V4L2 applicati: {', '.join(applied)}")
+
+
 def open_capture(cam_cfg):
     source = cam_cfg["camera_index"]
     # Path V4L2 assente = telecamera scollegata: inutile tentare l'apertura
@@ -159,6 +203,8 @@ def open_capture(cam_cfg):
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     if fps:
         cap.set(cv2.CAP_PROP_FPS, fps)
+
+    apply_v4l2_controls(source, cam_cfg.get("zone", "?"))
 
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -331,8 +377,11 @@ class CameraPipeline(threading.Thread):
         layouts = getattr(config, "NPU_CORES", [])
         cores = layouts[index] if index < len(layouts) else {}
         logger.info(f"[{self.zone}] Caricamento modelli NPU dedicati (core: {cores or 'auto'})...")
+        # Il detector COCO serve sia per le persone sia per coltello/bastone:
+        # il post-processing tiene il minimo tra le due soglie
         self.detect_model = DetectModel(DETECT_RKNN_PATH, core_mask=core_mask_from(cores.get("detect")),
-                                        conf_thresh=config.CONF_THRESHOLD, input_size=NPU_INPUT_SIZE)
+                                        conf_thresh=min(config.CONF_THRESHOLD, _prefilter(COCO_DANGER_THRESHOLDS)),
+                                        input_size=NPU_INPUT_SIZE)
         self.pose_model = PoseModel(POSE_RKNN_PATH, core_mask=core_mask_from(cores.get("pose")),
                                     conf_thresh=config.CONF_THRESHOLD, input_size=NPU_INPUT_SIZE)
 
@@ -341,13 +390,14 @@ class CameraPipeline(threading.Thread):
         self.weapon_model = None
         if getattr(config, "WEAPON_ENABLED", True):
             try:
-                # Sotto ALERT_MIN_CONF le armi vengono comunque scartate: filtrarle
-                # già nel post-processing evita NMS e risultati inutili.
+                # Solo le classi con una soglia in WEAPON_CLASS_THRESHOLDS; il
+                # post-processing scarta già ciò che non potrà mai superarla.
                 self.weapon_model = WeaponModel(
                     WEAPON_RKNN_PATH,
                     core_mask=core_mask_from(cores.get("weapon")),
-                    conf_thresh=max(getattr(config, "WEAPON_CONF_THRESHOLD", 0.35), ALERT_MIN_CONF),
+                    conf_thresh=_prefilter(WEAPON_CLASS_THRESHOLDS),
                     classes=getattr(config, "WEAPON_CLASSES", WEAPON_CLASSES),
+                    active_classes=list(WEAPON_CLASS_THRESHOLDS),
                     input_size=NPU_INPUT_SIZE,
                 )
             except Exception as e:
@@ -376,9 +426,14 @@ class CameraPipeline(threading.Thread):
         # In headless nessuno guarda il video: niente box/HUD da disegnare
         self.draw = not getattr(config, "HEADLESS", False)
 
-        # Conferma a tempo delle armi: danger_type -> istante di primo/ultimo avvistamento
-        self.danger_first_seen = {}
-        self.danger_last_seen = {}
+        # Conferma armi a finestra mobile (vedi danger_logic.py)
+        self.confirmer = DangerConfirmer(
+            window=getattr(config, "DANGER_WINDOW_SECONDS", 2.0),
+            min_span=getattr(config, "DANGER_CONFIRM_SECONDS", 1.0),
+            min_hits=getattr(config, "DANGER_MIN_HITS", 6),
+            min_ratio=getattr(config, "DANGER_MIN_RATIO", 0.5),
+        )
+        self.samples = SampleCollector(self.device_id)
         self.last_event_time = {}
         self.crowd_start_time = None
         self.presence_frames = 0
@@ -400,8 +455,7 @@ class CameraPipeline(threading.Thread):
 
     def reset(self):
         self.last_event_time.clear()
-        self.danger_first_seen.clear()
-        self.danger_last_seen.clear()
+        self.confirmer.reset()
         self.crowd_start_time = None
         logger.info(f"[{self.zone}] Reset manuale cooldown/contatori.")
 
@@ -452,8 +506,7 @@ class CameraPipeline(threading.Thread):
         with self.display_lock:
             self.latest_display = None
             self.display_version += 1
-        self.danger_first_seen.clear()
-        self.danger_last_seen.clear()
+        self.confirmer.reset()
         self.crowd_start_time = None
         self.presence_frames = 0
         self.last_detections = []
@@ -555,49 +608,52 @@ class CameraPipeline(threading.Thread):
             display_frame = raw_frame.copy() if draw else None
 
             # --- Analisi Oggetti Pericolosi (COCO + modello armi dedicato) ---
-            # danger_type -> confidenza migliore nel frame: ogni tipo conta una
-            # sola volta per frame anche se visto da entrambi i modelli.
-            dangers = {}
-            danger_dets = []
+            # Soglia per classe, abbassata di DANGER_HAND_BONUS se l'oggetto è
+            # vicino a un polso (pose). danger_type -> confidenza migliore nel
+            # frame: ogni tipo conta una volta per frame anche se visto da entrambi
+            # i modelli (es. "knife" COCO e "knife" del modello armi -> "coltello").
+            candidates = []   # (danger_type, class_name, det, soglia base)
             for det in detections:
                 class_name = det["class_name"].strip()
                 if class_name == "person":
-                    person_count += 1
-                if class_name in config.DANGER_CLASS_MAP and det["score"] > ALERT_MIN_CONF:
-                    danger_dets.append((config.DANGER_CLASS_MAP[class_name], class_name, det))
+                    if det["score"] >= config.CONF_THRESHOLD:
+                        person_count += 1
+                elif class_name in config.DANGER_CLASS_MAP and class_name in COCO_DANGER_THRESHOLDS:
+                    candidates.append((config.DANGER_CLASS_MAP[class_name], class_name, det,
+                                       COCO_DANGER_THRESHOLDS[class_name]))
             for det in self.last_weapons:
                 class_name = det["class_name"]
-                if class_name in WEAPON_CLASS_MAP and det["score"] > ALERT_MIN_CONF:
-                    danger_dets.append((WEAPON_CLASS_MAP[class_name], class_name, det))
+                if class_name in WEAPON_CLASS_MAP and class_name in WEAPON_CLASS_THRESHOLDS:
+                    candidates.append((WEAPON_CLASS_MAP[class_name], class_name, det,
+                                       WEAPON_CLASS_THRESHOLDS[class_name]))
 
-            for danger_type, class_name, det in danger_dets:
+            dangers = {}
+            sample_candidates = []
+            for danger_type, class_name, det, base_thr in candidates:
                 confidence = det["score"]
+                sample_candidates.append((danger_type, confidence, det["box"]))
+                near = near_hand(det["box"], pose_results, DANGER_HAND_MARGIN)
+                if DANGER_REQUIRE_HAND and not near:
+                    continue
+                if confidence < threshold_for(base_thr, near, DANGER_HAND_BONUS):
+                    continue
                 dangers[danger_type] = max(dangers.get(danger_type, 0.0), confidence)
                 if not draw:
                     continue
                 x1, y1, x2, y2 = map(int, det["box"])
                 cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                cv2.putText(display_frame, f"{class_name} {confidence:.2f}", (x1, max(20, y1 - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                cv2.putText(display_frame, f"{class_name} {confidence:.2f}{' mano' if near else ''}",
+                            (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-            # L'arma deve restare visibile per DANGER_CONFIRM_SECONDS prima di
-            # segnalare: un riconoscimento isolato non basta (falsi positivi).
-            # Buchi più brevi di DANGER_CONFIRM_GAP_SECONDS non azzerano il conteggio.
-            confirm = getattr(config, "DANGER_CONFIRM_SECONDS", 3.0)
-            gap = getattr(config, "DANGER_CONFIRM_GAP_SECONDS", 0.5)
-            for danger_type in list(self.danger_first_seen.keys()):
-                if danger_type not in dangers and now - self.danger_last_seen[danger_type] > gap:
-                    del self.danger_first_seen[danger_type]
-                    del self.danger_last_seen[danger_type]
+            # Campioni per il riaddestramento (anche sotto soglia: servono gli errori)
+            self.samples.maybe_save(now, raw_frame, sample_candidates)
 
-            danger_held = {}
-            for danger_type, confidence in dangers.items():
-                detected_this_frame.add(danger_type)
-                self.danger_last_seen[danger_type] = now
-                held = now - self.danger_first_seen.setdefault(danger_type, now)
-                danger_held[danger_type] = held
-                if held >= confirm:
-                    self._fire_event(now, danger_type, confidence, raw_frame)
+            # Conferma a finestra mobile: il pericolo deve essere visto in buona
+            # parte dei frame recenti, non in ogni singolo frame.
+            detected_this_frame.update(dangers)
+            for danger_type, confidence in self.confirmer.update(now, dangers).items():
+                self._fire_event(now, danger_type, confidence, raw_frame)
+            danger_progress = self.confirmer.progress()
 
             # --- Analisi Pose ---
             tracked = self.tracker.update(pose_results)
@@ -664,7 +720,7 @@ class CameraPipeline(threading.Thread):
                 logger.info(f"[{self.zone}] Prestazioni: {self._fps:.1f} FPS{' (riposo)' if self.idle else ''}, NPU ms medi: {npu}")
 
             if draw:
-                self._draw_hud(display_frame, person_count, dangers, danger_held, gesture_triggered)
+                self._draw_hud(display_frame, person_count, dangers, danger_progress, gesture_triggered)
                 with self.display_lock:
                     self.latest_display = display_frame
                     self.display_version += 1
@@ -675,11 +731,12 @@ class CameraPipeline(threading.Thread):
                     f"allarmi_attivi={list(detected_this_frame)}, clip_rec={self.clip.is_recording()}, fps={self._fps:.1f}"
                 )
 
-    def _draw_hud(self, display_frame, person_count, dangers, danger_held, gesture_triggered):
+    def _draw_hud(self, display_frame, person_count, dangers, danger_progress, gesture_triggered):
         hud.draw_progress_bar(display_frame, "Gesto aiuto", self.gesture.progress())
         hud.draw_panel(display_frame, [
             ("Persone", False, f"({person_count})"),
-            ("Arma", bool(dangers), "(" + ", ".join(f"{t} {s:.1f}s" for t, s in danger_held.items()) + ")" if dangers else ""),
+            ("Arma", bool(dangers),
+             "(" + ", ".join(f"{t} {p * 100:.0f}%" for t, p in danger_progress.items()) + ")" if danger_progress else ""),
             ("Assembramento", self.crowd_start_time is not None, ""),
             ("Gesto aiuto", gesture_triggered, ""),
         ], recording=self.clip.is_recording())
@@ -810,6 +867,8 @@ def main():
             if now - last_cleanup_time > getattr(config, "STORAGE_CLEANUP_INTERVAL_SECONDS", 1800):
                 cleanup_old_files("snapshots", getattr(config, "MAX_SNAPSHOTS_COUNT", 500))
                 cleanup_old_files(getattr(config, "VIDEO_CLIP_DIR", "clips"), getattr(config, "MAX_CLIPS_COUNT", 100))
+                cleanup_samples(getattr(config, "WEAPON_SAMPLES_DIR", "weapon_samples"),
+                                getattr(config, "WEAPON_SAMPLES_MAX_COUNT", 3000))
                 last_cleanup_time = now
 
             if not getattr(config, "HEADLESS", False):
