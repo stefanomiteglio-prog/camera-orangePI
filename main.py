@@ -364,6 +364,14 @@ class CameraPipeline(threading.Thread):
         self.detect_every = max(1, getattr(config, "DETECT_PROCESS_EVERY", 2))
         self.weapon_every = max(1, getattr(config, "WEAPON_PROCESS_EVERY", 2))
         self.hands_every = max(1, getattr(config, "HANDS_PROCESS_EVERY", 3))
+        # Modalità riposo: senza persone da idle_after secondi i modelli NPU rallentano
+        self.idle_after = getattr(config, "IDLE_AFTER_SECONDS", 5.0)
+        self.idle_every = max(1, getattr(config, "IDLE_PROCESS_EVERY", 1))
+        self.last_person_time = time.time()
+        self.idle = False
+        max_fps = getattr(config, "PROCESS_MAX_FPS", 0)
+        self.process_interval = 1.0 / max_fps if max_fps > 0 else 0.0
+        self.next_process_t = 0.0
         self.hands_only_with_person = getattr(config, "HANDS_ONLY_WITH_PERSON", True)
         # In headless nessuno guarda il video: niente box/HUD da disegnare
         self.draw = not getattr(config, "HEADLESS", False)
@@ -381,6 +389,7 @@ class CameraPipeline(threading.Thread):
         self.last_pose = []
 
         self._fps = 0.0
+        self._frame_dt = 0.0
         self._last_fps_t = time.time()
 
         self.latest_display = None
@@ -451,6 +460,7 @@ class CameraPipeline(threading.Thread):
         self.last_weapons = []
         self.last_pose = []
         self._fps = 0.0
+        self._frame_dt = 0.0
         self.clip.flush()
 
     def run(self):
@@ -479,6 +489,12 @@ class CameraPipeline(threading.Thread):
                 logger.info(f"[{self.zone}] Segnale video ripristinato.")
 
             now = time.time()
+            # Limite PROCESS_MAX_FPS: a 30 FPS di camera e 20 di limite passano 2 frame su 3.
+            # Tolleranza di 5 ms per il jitter dei timestamp di cattura.
+            if self.process_interval:
+                if now < self.next_process_t - 0.005:
+                    continue
+                self.next_process_t = max(self.next_process_t + self.process_interval, now - self.process_interval)
             self.frame_idx += 1
 
             # 1. Aggiorna buffer circolare clip video con il frame raw pulito
@@ -492,10 +508,21 @@ class CameraPipeline(threading.Thread):
             #    I risultati vengono riusati nei frame in cui l'inferenza è saltata.
             #    Letterbox + RGB calcolati una volta sola e condivisi dai modelli NPU.
             futures = {}
-            run_pose = self.frame_idx % self.pose_every == 0
-            run_detect = self.frame_idx % self.detect_every == 0
-            # Sfalsata di un frame rispetto a COCO per non sommare i due carichi NPU
-            run_weapon = self.weapon_model is not None and (self.frame_idx + 1) % self.weapon_every == 0
+            idle = self.idle_every > 1 and now - self.last_person_time > self.idle_after
+            if idle != self.idle:
+                self.idle = idle
+                logger.info(f"[{self.zone}] Modalità riposo {'attiva' if idle else 'disattivata'}.")
+            if idle:
+                # Un solo modello per frame, a turno: pose, detect, armi
+                n = self.idle_every
+                run_pose = self.frame_idx % n == 0
+                run_detect = (self.frame_idx + n // 3) % n == 0
+                run_weapon = self.weapon_model is not None and (self.frame_idx + 2 * n // 3) % n == 0
+            else:
+                run_pose = self.frame_idx % self.pose_every == 0
+                run_detect = self.frame_idx % self.detect_every == 0
+                # Sfalsata di un frame rispetto a COCO per non sommare i due carichi NPU
+                run_weapon = self.weapon_model is not None and (self.frame_idx + 1) % self.weapon_every == 0
             prep = preprocess(raw_frame, self.pose_model.input_size) if (run_pose or run_detect or run_weapon) else None
             if run_pose:
                 futures["pose"] = self.executor.submit(self.pose_model.infer, raw_frame, prep)
@@ -595,6 +622,8 @@ class CameraPipeline(threading.Thread):
             # --- Presenza (accensione luci di zona) ---
             # Persona vista dal detector COCO oppure dal modello pose: basta uno dei due.
             people = max(person_count, len(tracked))
+            if people > 0:
+                self.last_person_time = now
             self.presence_frames = self.presence_frames + 1 if people > 0 else 0
             if (
                 getattr(config, "PRESENCE_ENABLED", True)
@@ -618,11 +647,12 @@ class CameraPipeline(threading.Thread):
                 self._fire_event(now, "segnale_aiuto", 1.0, raw_frame)
 
             # --- HUD ---
-            # FPS smussato
+            # FPS smussato: media degli intervalli, non di 1/dt (con intervalli
+            # irregolari, es. 33/67 ms, la media di 1/dt sovrastima gli FPS reali)
             dt = now - self._last_fps_t
             if dt > 0:
-                inst = 1.0 / dt
-                self._fps = inst if self._fps == 0 else (self._fps * 0.9 + inst * 0.1)
+                self._frame_dt = dt if self._frame_dt == 0 else (self._frame_dt * 0.95 + dt * 0.05)
+                self._fps = 1.0 / self._frame_dt
             self._last_fps_t = now
 
             if self.frame_idx % 300 == 0:
@@ -631,7 +661,7 @@ class CameraPipeline(threading.Thread):
                     for name, m in (("pose", self.pose_model), ("detect", self.detect_model), ("weapon", self.weapon_model))
                     if m is not None
                 )
-                logger.info(f"[{self.zone}] Prestazioni: {self._fps:.1f} FPS, NPU ms medi: {npu}")
+                logger.info(f"[{self.zone}] Prestazioni: {self._fps:.1f} FPS{' (riposo)' if self.idle else ''}, NPU ms medi: {npu}")
 
             if draw:
                 self._draw_hud(display_frame, person_count, dangers, danger_held, gesture_triggered)

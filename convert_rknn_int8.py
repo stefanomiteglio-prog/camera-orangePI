@@ -99,7 +99,7 @@ def main():
     ap.add_argument("onnx", help="modello .onnx da export_onnx_split.py")
     ap.add_argument("--calib", nargs="+", required=True, help="cartelle o file (immagini/video) di calibrazione")
     ap.add_argument("--width", type=int, default=640)
-    ap.add_argument("--height", type=int, default=480)
+    ap.add_argument("--height", type=int, default=640)
     ap.add_argument("--max-images", type=int, default=300)
     ap.add_argument("--frames-per-video", type=int, default=10)
     ap.add_argument("--target", default="rk3588")

@@ -61,7 +61,7 @@ def main():
     ap = argparse.ArgumentParser(description="Export ONNX a head separata per RKNN INT8")
     ap.add_argument("weights", help="pesi Ultralytics .pt (yolov8 detect o pose)")
     ap.add_argument("--width", type=int, default=640, help="larghezza input (multiplo di 32)")
-    ap.add_argument("--height", type=int, default=480, help="altezza input (multiplo di 32)")
+    ap.add_argument("--height", type=int, default=640, help="altezza input (multiplo di 32; 480 sconsigliato, vedi README)")
     ap.add_argument("--output", help="file .onnx di uscita (default: <pesi>_split.onnx)")
     ap.add_argument("--opset", type=int, default=12)
     args = ap.parse_args()

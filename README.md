@@ -211,39 +211,63 @@ e imposta `VLM_MODEL = "moondream"` in config.py.
 
 ## Modelli NPU in INT8 (velocità)
 
-I modelli `yolov8s-pose.rknn` (26 MB) e `weapon_threat.rknn` (7,9 MB) nascono
-dall'export standard di Ultralytics, che **non quantizza**: girano in FP16,
-circa 3 volte più lenti dell'INT8 (la pose occupa ~110 ms per frame su un core).
-Lo yolov8n del model zoo è già INT8.
+In produzione pose e armi girano in INT8 a head separata, 640x640:
+`yolov8s-pose_split640.rknn` (13 MB, ~40 ms per inferenza contro ~140 dell'FP16)
+e `weapon_threat_split640.rknn` (4,1 MB, ~20 ms contro ~70). Lo yolov8n del
+model zoo è già INT8 a 640x640 e resta com'è. I vecchi `yolov8s-pose.rknn` e
+`weapon_threat.rknn` (export standard di Ultralytics, FP16) funzionano ancora.
 
 L'export standard non si può quantizzare così com'è: mette coordinate in pixel e
 confidenze nello stesso tensore e in INT8 le confidenze perderebbero precisione.
 Per questo la conversione passa da un export **a head separata**
 (`export_onnx_split.py`) e la decodifica la fa `rknn_backend.py` su CPU.
-`rknn_backend.py` riconosce da solo il formato: i `.rknn` attuali continuano a funzionare.
+`rknn_backend.py` riconosce da solo il formato.
 
-1. **Export ONNX** (qualsiasi PC con `pip install ultralytics onnx`, anche Windows):
+**Risoluzione: 640x640, non 640x480.** I modelli sono addestrati su immagini
+640x640 con bordo grigio. A 640x480 (frame senza bordo) il modello armi perde le
+esplosioni anche senza quantizzazione: confidenza massima sugli snapshot 0,69 in
+FP16 640x640, 0,45 in FP16 640x480, 0,31 in INT8 640x480. In INT8 640x640 il
+confronto con l'FP16 su 31 immagini reali è 23 rilevazioni su 23, esplosione 0,70.
+
+1. **Export ONNX** (qualsiasi PC con `pip install ultralytics onnx`, anche Windows;
+   default 640x640):
    ```bash
-   python export_onnx_split.py yolov8s-pose.pt
-   python export_onnx_split.py weapon_threat.pt
-   python export_onnx_split.py yolov8n.pt
+   python export_onnx_split.py yolov8s-pose.pt --output yolov8s-pose_split640.onnx
+   python export_onnx_split.py weapon_threat.pt --output weapon_threat_split640.onnx
    ```
-   Default input 640x480 (come le telecamere: nessun bordo, ~25% di calcolo in meno).
    Lo script stampa le classi del modello: per le armi l'ordine deve coincidere
    con `WEAPON_CLASSES` in `config.py`.
-2. **Immagini di calibrazione**: copia dall'Orange Pi le cartelle `snapshots/` e `clips/`
-   (100-300 immagini reali, varie per luce e presenza di persone).
-3. **Conversione INT8** (Linux x86_64/aarch64 o WSL2, `pip install rknn-toolkit2 opencv-python`):
+2. **Immagini di calibrazione**: le cartelle `snapshots/` e `clips/` dell'Orange Pi
+   (150-300 immagini reali, varie per luce e presenza di persone).
+3. **Conversione INT8** (Linux x86_64/aarch64 o WSL2, `pip install rknn-toolkit2 opencv-python`;
+   sull'Orange Pi in un venv separato con rknn-toolkit2 della stessa versione di
+   `librknnrt`, es. 2.3.2):
    ```bash
-   python convert_rknn_int8.py yolov8s-pose_split.onnx --calib snapshots clips
-   python convert_rknn_int8.py weapon_threat_split.onnx --calib snapshots clips
-   python convert_rknn_int8.py yolov8n_split.onnx --calib snapshots clips
+   python convert_rknn_int8.py yolov8s-pose_split640.onnx --calib snapshots clips
+   python convert_rknn_int8.py weapon_threat_split640.onnx --calib snapshots clips
    ```
-   Con `--analyze` confronta float e INT8 strato per strato.
-4. **Sull'Orange Pi**: copia i tre `*_split.rknn`, aggiorna `POSE_RKNN_PATH`,
-   `WEAPON_RKNN_PATH`, `DETECT_RKNN_PATH` e imposta `NPU_INPUT_SIZE = (640, 480)`
-   in `config.py`. I tre modelli vanno sostituiti insieme (stessa dimensione di input).
-5. **Verifica**: nel log `Prestazioni` la pose dovrebbe scendere a circa 30-40 ms
-   (da ~110); `sudo cat /sys/kernel/debug/rknpu/load` mostra il carico per core.
-   Controlla che armi e scheletri vengano ancora riconosciuti: se l'INT8 perde
-   precisione su un modello, rifai la calibrazione con più immagini o usa `--analyze`.
+   Con `--analyze` confronta float e INT8 strato per strato. Sull'Orange Pi la pose
+   richiede ~5 minuti con 150 immagini (`--max-images 150`).
+4. **Sull'Orange Pi**: copia i `*_split640.rknn` nella cartella del progetto e
+   aggiorna `POSE_RKNN_PATH` e `WEAPON_RKNN_PATH` in `config.py`;
+   `NPU_INPUT_SIZE` resta `(640, 640)`.
+5. **Verifica**: nel log `Prestazioni` pose ~40-50 ms e armi ~20-35 ms (con due
+   telecamere sui core condivisi); `sudo cat /sys/kernel/debug/rknpu/load` mostra
+   il carico per core. Controlla che armi e scheletri vengano ancora riconosciuti:
+   se l'INT8 perde precisione su un modello, rifai la calibrazione con più immagini
+   o usa `--analyze`.
+
+### Cadenze e modalità riposo
+
+Il ciclo di ogni telecamera aspetta i modelli del frame prima di passare al
+successivo. Per contenere il carico (`config.py`):
+
+- `PROCESS_MAX_FPS = 20`: frame elaborati al secondo per telecamera; le webcam USB
+  ignorano `CAMERA_FPS` sotto 30, quindi i frame in eccesso vengono scartati.
+- `POSE_PROCESS_EVERY = 2`, `DETECT_PROCESS_EVERY = 3`, `WEAPON_PROCESS_EVERY = 3`:
+  nei frame saltati si riusano gli ultimi risultati.
+- Modalità riposo: senza persone per `IDLE_AFTER_SECONDS` (5 s) i tre modelli NPU
+  girano a turno ogni `IDLE_PROCESS_EVERY` frame (6); il log segnala
+  "Modalità riposo attiva/disattivata" e la riga `Prestazioni` mostra "(riposo)".
+
+Gli FPS del log e dell'HUD sono la media degli intervalli tra frame elaborati.
