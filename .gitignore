@@ -21,7 +21,7 @@ yolov8*.pt
 *.rknn
 
 # Modelli serializzati: rimuovi questa riga se vuoi versionare il classificatore addestrato
-gesture_classifier.pkl
+gesture_model.pkl
 
 # Configurazione locale: mantieni questa riga solo se config.py contiene segreti o impostazioni personali
 # config.py
@@ -36,3 +36,15 @@ calib/
 
 # Archivi di export
 *.zip
+
+# Dataset del gesto di aiuto e modello addestrato (rigenerabile con train_gesture_classifier.py)
+gesture_dataset/
+*.csv
+# Certificati / chiavi (root CA di Caddy copiata dal server)
+*.crt
+*.pem
+*.key
+# Pesi PyTorch, backup locali e analisi
+*.pt
+config.py.bak*
+weapon_threat_split_analysis/

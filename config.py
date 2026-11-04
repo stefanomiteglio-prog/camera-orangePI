@@ -37,20 +37,24 @@ CAMERA_V4L2_CONTROLS = {
 POSE_PROCESS_EVERY = 2     # stima pose/scheletro (serve a tracking, scheletro e presenze; il gesto lo fa MediaPipe)
 DETECT_PROCESS_EVERY = 3   # detection oggetti COCO (persone/bastone/coltello)
 WEAPON_PROCESS_EVERY = 3   # detection armi (weapon_threat.rknn), sfalsata di un frame rispetto a COCO
-HANDS_PROCESS_EVERY = 3    # gesto aiuto (MediaPipe, il più costoso su CPU)
+HANDS_PROCESS_EVERY = 1    # gesto aiuto: ogni frame, come nel vecchio progetto (la sequenza è di 15 frame consecutivi)
+# Pipeline a un frame: le inferenze NPU/MediaPipe del frame N girano mentre la
+# CPU elabora il frame N con i risultati del frame N-1 (circa 50-60 ms di
+# ritardo): il tempo per frame diventa max(NPU, CPU) invece della somma.
+PIPELINE_INFERENCE = True
 # Modalità riposo: se nessun modello vede persone da IDLE_AFTER_SECONDS, pose,
 # detect e armi girano solo ogni IDLE_PROCESS_EVERY frame (sfalsati, mai insieme).
-# Alla prima persona vista si torna subito alle cadenze sopra. Tenere l'intervallo
-# sotto DANGER_CONFIRM_GAP_SECONDS (6 frame a 20 FPS = 0,3 s), altrimenti
-# un'arma o un'esplosione senza persone non verrebbe mai confermata.
+# Alla prima persona vista si torna subito alle cadenze sopra. I risultati
+# restano validi tra un'inferenza e l'altra, quindi la conferma armi a finestra
+# mobile (DANGER_WINDOW_*) continua a funzionare anche senza persone.
 IDLE_AFTER_SECONDS = 5.0
 IDLE_PROCESS_EVERY = 6
 # MediaPipe gira sulla CPU: senza persone viste dal modello pose (NPU) è inutile
 # cercare mani, e si salta del tutto.
-HANDS_ONLY_WITH_PERSON = True
+HANDS_ONLY_WITH_PERSON = False   # una mano vicina alla telecamera spesso non è vista come persona
 
 # Complessità del modello MediaPipe Hands: 0 = lite (veloce), 1 = full (preciso)
-HANDS_MODEL_COMPLEXITY = 0
+HANDS_MODEL_COMPLEXITY = 1   # come nel vecchio progetto
 
 # --- Telecamere multiple (Zona A / Zona B) -------------------------------
 # Ogni telecamera invia al backend con il PROPRIO 'device_id' (stringa libera,
@@ -108,9 +112,19 @@ MQTT_CLIENT_ID = "treeeyes-vision-node"
 
 # --- Backend HTTP REST ---------------------------------------------------
 # Host Backend HTTP: http://<IP_SERVER>:8000 (o porta 5173 se tramite reverse-proxy)
-BACKEND_HTTP_HOST = "192.168.88.10"
-BACKEND_HTTP_PORT = 8000
-BACKEND_HTTP_URL = f"http://{BACKEND_HTTP_HOST}:{BACKEND_HTTP_PORT}"
+# Il backend è dietro il reverse proxy Caddy del server, in HTTPS sul dominio API.
+API_DOMAIN = "api.treeyes.home.arpa"
+BACKEND_HTTP_HOST = API_DOMAIN
+BACKEND_HTTP_PORT = 443
+BACKEND_HTTP_URL = f"https://{API_DOMAIN}"
+# Certificato: Caddy usa la sua CA locale ("Caddy Local Authority"), che il
+# sistema non conosce. Copia la root dal server
+# (<dati caddy>/pki/authorities/local/root.crt) in questa cartella come
+# caddy_root.crt: le richieste HTTPS la usano per verificare il certificato.
+# Senza il file si usano le CA di sistema (e la verifica fallisce).
+import os as _os
+_CADDY_ROOT = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "caddy_root.crt")
+BACKEND_TLS_VERIFY = _CADDY_ROOT if _os.path.exists(_CADDY_ROOT) else True
 
 # Endpoint specifici per la telecamera
 BACKEND_ME_URL = f"{BACKEND_HTTP_URL}/devices/me"           # Handshake/autorizzazione (o /api/vision/me)
@@ -143,7 +157,7 @@ TELEGRAM_CHAT_ID = ""
 
 # --- Modello YOLO / RKNN ----------------------------------------------
 # Percorsi modelli RKNN compilati per NPU Rockchip (RK3588 su Orange Pi 5)
-POSE_RKNN_PATH = "yolov8s-pose_split640.rknn"
+POSE_RKNN_PATH = "yolov8s-pose_split640.rknn"   # INT8 640x640 (FP16: yolov8s-pose.rknn)
 DETECT_RKNN_PATH = "rknn_test/rknn_model_zoo/examples/yolov8/model/yolov8n.rknn"
 RKNN_TARGET = "rk3588"
 
@@ -169,7 +183,7 @@ NPU_CORES = [
 # Modello dedicato armi/minacce (presente solo sull'Orange Pi, nella cartella
 # del progetto). Se il file manca il nodo parte comunque, senza questo modello.
 WEAPON_ENABLED = True
-WEAPON_RKNN_PATH = "weapon_threat_split640.rknn"
+WEAPON_RKNN_PATH = "weapon_threat_split640.rknn"   # INT8 640x640 (FP16: weapon_threat.rknn)
 # Ordine delle classi = ordine di addestramento del modello: NON cambiarlo.
 WEAPON_CLASSES = ["Gun", "explosion", "grenade", "knife"]
 # Nuovo modello addestrato con train_weapon_model.py (vedi README, "Modello
@@ -185,9 +199,10 @@ WEAPON_CLASSES = ["Gun", "explosion", "grenade", "knife"]
 # Riferimento: un coltello da cucina a ~1 m dà tipicamente 0.4-0.8; la vecchia
 # soglia 0.90 scartava quasi tutti i rilevamenti veri. I falsi positivi isolati
 # li elimina la conferma a finestra mobile (DANGER_WINDOW_*), non la soglia.
+# Alzate (0.40/0.50 -> 0.60/0.65) per ridurre i falsi positivi.
 WEAPON_CLASS_THRESHOLDS = {
-    "knife": 0.40,
-    "Gun": 0.50,
+    "knife": 0.60,
+    "Gun": 0.75,
 }
 # Classe del modello -> alert_type inviato al backend
 WEAPON_CLASS_MAP = {
@@ -224,7 +239,7 @@ CONF_THRESHOLD = 0.3
 # Le soglie vere sono per classe (WEAPON_CLASS_THRESHOLDS, COCO_DANGER_THRESHOLDS).
 # Per le armi la confidenza pubblicata è la MEDIA degli score nella finestra di
 # conferma. Era 0.90: bloccava di fatto ogni rilevamento di coltello.
-ALERT_MIN_CONF = 0.30
+ALERT_MIN_CONF = 0.50
 
 # Classi COCO gia' presenti nel modello pre-addestrato che ci interessano.
 # COCO include gia' "knife" (coltello) e "baseball bat" (bastone) di serie.
@@ -239,14 +254,14 @@ DANGER_CLASS_MAP = {
 }
 # Soglia per classe COCO (solo le classi elencate generano allarmi)
 COCO_DANGER_THRESHOLDS = {
-    "knife": 0.35,
-    "baseball bat": 0.45,
+    "knife": 0.55,
+    "baseball bat": 0.60,
 }
 
 # Oggetto vicino a un polso di una persona (keypoint del modello pose): la
 # soglia di quella rilevazione viene abbassata di DANGER_HAND_BONUS. Un coltello
 # in mano è molto più credibile di uno "visto" sullo sfondo.
-DANGER_HAND_BONUS = 0.10
+DANGER_HAND_BONUS = 0.05
 # Distanza massima polso-oggetto, in frazione dell'altezza della persona
 DANGER_HAND_MARGIN = 0.25
 # True = conta SOLO oggetti vicini a una mano. Riduce molto i falsi positivi,
@@ -267,10 +282,10 @@ CONSECUTIVE_FRAMES_THRESHOLD = 5   # usato solo da main_pc_backup.py
 # Così una lama che sparisce per qualche frame (di taglio, mano che ruota) non
 # azzera la conferma, mentre i falsi positivi isolati non arrivano mai a scattare.
 # A 17-20 FPS: 1 s di conferma = circa 9-10 frame positivi su ~18-20.
-DANGER_WINDOW_SECONDS = 2.0
-DANGER_CONFIRM_SECONDS = 1.0
-DANGER_MIN_HITS = 6
-DANGER_MIN_RATIO = 0.5
+DANGER_WINDOW_SECONDS = 2.5
+DANGER_CONFIRM_SECONDS = 1.5
+DANGER_MIN_HITS = 9
+DANGER_MIN_RATIO = 0.6
 
 # --- Raccolta campioni per il riaddestramento (sample_collector.py) -------
 # Salva frame + etichette YOLO pre-compilate quando un modello vede un'arma
@@ -282,16 +297,23 @@ WEAPON_SAMPLES_MIN_CONF = 0.25
 WEAPON_SAMPLES_INTERVAL_SECONDS = 2.0    # al massimo un frame ogni N secondi per telecamera
 WEAPON_SAMPLES_MAX_COUNT = 3000          # i più vecchi vengono eliminati
 
-EVENT_COOLDOWN_SECONDS = 5
+# Limite segnalazioni, per zona (telecamera):
+#  1) cooldown per tipo: lo stesso tipo di allarme al massimo ogni N secondi;
+#  2) tetto globale: al massimo ALERT_RATE_LIMIT_COUNT segnalazioni (di qualunque
+#     tipo) negli ultimi ALERT_RATE_LIMIT_WINDOW_SECONDS. Oltre il tetto gli
+#     allarmi vengono solo scritti nel log, finché la finestra non si libera.
+EVENT_COOLDOWN_SECONDS = 60
 EVENT_COOLDOWN_MAP = {
-    "segnale_aiuto": 5,             # Cooldown 5s per gesto aiuto (specifica)
-    "arma": 10,
-    "arma_da_fuoco": 10,
-    "coltello": 10,
-    "granata": 10,
-    "esplosione": 10,
-    "assembramento": 30,
+    "segnale_aiuto": 60,
+    "arma": 60,
+    "arma_da_fuoco": 60,
+    "coltello": 60,
+    "granata": 60,
+    "esplosione": 60,
+    "assembramento": 60,
 }
+ALERT_RATE_LIMIT_COUNT = 10
+ALERT_RATE_LIMIT_WINDOW_SECONDS = 600
 
 # --- Presenza (accensione luci di zona) -----------------------------------
 # Quando la telecamera vede almeno una persona pubblica parco/<device_id>/presence:
@@ -324,10 +346,19 @@ WHISPER_MODEL = "small"
 HELP_KEYWORDS = ["aiuto", "aiutatemi", "aiutami", "help"]
 AUDIO_EVENT_COOLDOWN_SECONDS = 20
 
-HELP_GESTURE_HOLD_FRAMES = 8
-HELP_GESTURE_OPEN_HOLD_FRAMES = 3
-HELP_GESTURE_WINDOW_SECONDS = 4
-HELP_GESTURE_TUCK_RATIO = 0.35
+# --- Gesto di aiuto (classificatore su sequenze di landmark MediaPipe) ---
+# Modello addestrato con train_gesture_classifier.py sul dataset
+# gesture_dataset/dataset_seq.csv (sequenze di 15 frame, etichette aiuto/normale).
+HELP_GESTURE_MODEL_PATH = "gesture_model.pkl"
+HELP_GESTURE_SEQUENCE_LENGTH = 15
+# Stesso metodo del vecchio progetto (riconoscimento_mano_definitivo.py):
+# MediaPipe a confidenza 0.7, coordinate specchiate come in registrazione,
+# allarme dopo 4 predizioni "aiuto" consecutive (ml_counter > 3).
+HELP_GESTURE_HAND_CONFIDENCE = 0.7
+HELP_GESTURE_MIRROR = True
+HELP_GESTURE_CONSECUTIVE = 4
+# Mano persa per più di N secondi: la sequenza riparte da zero
+HELP_GESTURE_RESET_SECONDS = 2.0
 
 VIDEO_CLIP_ENABLED = True
 VIDEO_CLIP_PRE_SECONDS = 5          # Buffer 5s prima dell'evento
@@ -357,6 +388,3 @@ VLM_QUESTIONS = {
 }
 VLM_DEFAULT_QUESTION = "Nell'immagine e' visibile una situazione di pericolo reale?"
 
-# Soglie gesto aiuto basate sul tempo reale (indipendenti dagli FPS)
-HELP_GESTURE_OPEN_HOLD_SECONDS = 0.3
-HELP_GESTURE_TUCKED_HOLD_SECONDS = 0.8

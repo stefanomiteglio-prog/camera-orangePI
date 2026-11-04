@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 
 import cv2
 import numpy as np
@@ -435,6 +436,8 @@ class CameraPipeline(threading.Thread):
         )
         self.samples = SampleCollector(self.device_id)
         self.last_event_time = {}
+        self.recent_events = deque()      # istanti delle segnalazioni inviate (tetto globale)
+        self._rate_limit_logged = 0.0
         self.crowd_start_time = None
         self.presence_frames = 0
         self.last_presence_time = 0.0
@@ -442,6 +445,8 @@ class CameraPipeline(threading.Thread):
         self.last_detections = []
         self.last_weapons = []
         self.last_pose = []
+        self._pending = {}   # inferenze lanciate e non ancora raccolte (pipeline)
+        self.pipelined = getattr(config, "PIPELINE_INFERENCE", True)
 
         self._fps = 0.0
         self._frame_dt = 0.0
@@ -455,6 +460,7 @@ class CameraPipeline(threading.Thread):
 
     def reset(self):
         self.last_event_time.clear()
+        self.recent_events.clear()
         self.confirmer.reset()
         self.crowd_start_time = None
         logger.info(f"[{self.zone}] Reset manuale cooldown/contatori.")
@@ -464,7 +470,20 @@ class CameraPipeline(threading.Thread):
         if now - self.last_event_time.get(danger_type, 0) < cooldown:
             return False
 
+        # Tetto globale per zona: al massimo N segnalazioni nella finestra mobile
+        limit = getattr(config, "ALERT_RATE_LIMIT_COUNT", 0)
+        window = getattr(config, "ALERT_RATE_LIMIT_WINDOW_SECONDS", 600)
+        while self.recent_events and now - self.recent_events[0] > window:
+            self.recent_events.popleft()
+        if limit > 0 and len(self.recent_events) >= limit:
+            if now - self._rate_limit_logged > 30:
+                self._rate_limit_logged = now
+                logger.warning(f"[{self.zone}] Limite segnalazioni raggiunto ({limit} in {window}s): "
+                               f"{danger_type} (conf={confidence:.2f}) non inviato")
+            return False
+
         self.last_event_time[danger_type] = now
+        self.recent_events.append(now)
         os.makedirs("snapshots", exist_ok=True)
         snapshot_path = f"snapshots/{self.device_id}_{danger_type}_{int(now)}.jpg"
         frame_copy = raw_frame.copy()
@@ -493,6 +512,17 @@ class CameraPipeline(threading.Thread):
         """True se la telecamera della zona sta mandando frame."""
         return self.capture is not None and self.capture.has_signal()
 
+    def _collect_pending(self):
+        """Attende le inferenze in corso e ne salva i risultati. Ritorna il gesto aiuto."""
+        pending, self._pending = self._pending, {}
+        if "pose" in pending:
+            self.last_pose = pending["pose"].result()
+        if "detect" in pending:
+            self.last_detections = pending["detect"].result()
+        if "weapon" in pending:
+            self.last_weapons = pending["weapon"].result()
+        return pending["hands"].result() if "hands" in pending else False
+
     def _on_signal_lost(self):
         """
         Telecamera assente/scollegata: la pipeline resta viva in attesa dei frame.
@@ -509,6 +539,10 @@ class CameraPipeline(threading.Thread):
         self.confirmer.reset()
         self.crowd_start_time = None
         self.presence_frames = 0
+        try:
+            self._collect_pending()   # nessuna inferenza ancora in volo sui contesti NPU
+        except Exception:
+            self._pending = {}
         self.last_detections = []
         self.last_weapons = []
         self.last_pose = []
@@ -560,6 +594,12 @@ class CameraPipeline(threading.Thread):
             # 2. Inferenze in parallelo su thread dedicati, con cadenze indipendenti.
             #    I risultati vengono riusati nei frame in cui l'inferenza è saltata.
             #    Letterbox + RGB calcolati una volta sola e condivisi dai modelli NPU.
+            #    Pipeline a un frame: si raccolgono i risultati lanciati al frame
+            #    precedente (calcolati mentre la CPU elaborava quel frame) e si
+            #    lanciano quelli del frame corrente, che verranno usati al prossimo.
+            #    Il tempo per frame diventa max(NPU, CPU) invece di NPU + CPU.
+            if self.pipelined:
+                gesture_triggered = self._collect_pending()
             futures = {}
             idle = self.idle_every > 1 and now - self.last_person_time > self.idle_after
             if idle != self.idle:
@@ -587,18 +627,16 @@ class CameraPipeline(threading.Thread):
                 # MediaPipe (CPU) solo se nel frame precedente c'era qualcuno
                 someone = bool(self.last_pose) or any(d["class_name"] == "person" for d in self.last_detections)
                 if someone or not self.hands_only_with_person:
-                    small_raw = cv2.resize(raw_frame, (raw_frame.shape[1] // 2, raw_frame.shape[0] // 2))
-                    futures["hands"] = self.executor.submit(self.gesture.detect, small_raw, False)
+                    # Frame intero come nel vecchio progetto (raw_frame non viene mai modificato)
+                    futures["hands"] = self.executor.submit(self.gesture.detect, raw_frame, False)
                 else:
                     self.gesture.idle()
 
-            if "pose" in futures:
-                self.last_pose = futures["pose"].result()
-            if "detect" in futures:
-                self.last_detections = futures["detect"].result()
-            if "weapon" in futures:
-                self.last_weapons = futures["weapon"].result()
-            gesture_triggered = futures["hands"].result() if "hands" in futures else False
+            if self.pipelined:
+                self._pending = futures
+            else:
+                self._pending = futures
+                gesture_triggered = self._collect_pending()
 
             pose_results = self.last_pose
             detections = self.last_detections
@@ -700,7 +738,7 @@ class CameraPipeline(threading.Thread):
 
             # --- Skeleton + gesto aiuto ---
             if gesture_triggered:
-                self._fire_event(now, "segnale_aiuto", 1.0, raw_frame)
+                self._fire_event(now, "segnale_aiuto", self.gesture.last_confidence, raw_frame)
 
             # --- HUD ---
             # FPS smussato: media degli intervalli, non di 1/dt (con intervalli

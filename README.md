@@ -145,17 +145,16 @@ Parametri configurabili in `config.py`:
 ## Skeleton completo e segnale di aiuto
 
 - ✅ Skeleton corpo intero (MediaPipe Pose, 33 punti, stile "Palantir")
-- ✅ Segnale di aiuto con le mani: palmo aperto → entro 4 secondi → pugno con
-  pollice piegato dentro il palmo, tenuto per alcuni frame (gesto internazionale
-  "Signal for Help")
+- ✅ Segnale di aiuto con le mani ("Signal for Help": palmo aperto → pugno con
+  pollice ripiegato), riconosciuto da un classificatore su sequenze di 15 frame
+  (vedi "Gesto di aiuto")
 
-Nota: MediaPipe Hands rileva max 2 mani senza associarle a un track_id specifico
-(va bene con una persona sola in scena; con più persone contemporanee andrebbe
-associato il gesto alla persona più vicina tramite le coordinate).
+Nota: MediaPipe Hands segue una sola mano senza associarla a un track_id
+(va bene con una persona sola in scena).
 
 ## Precisione migliorata
 
-- Gesto aiuto: soglie normalizzate sulla diagonale della mano (invariante alla distanza), richiede palmo aperto stabile prima del pugno
+- Gesto aiuto: 4 predizioni "aiuto" consecutive del classificatore prima dell'allarme
 
 ## HUD di stato e Finestra a Schermo Intero
 
@@ -274,7 +273,37 @@ successivo. Per contenere il carico (`config.py`):
   girano a turno ogni `IDLE_PROCESS_EVERY` frame (6); il log segnala
   "Modalità riposo attiva/disattivata" e la riga `Prestazioni` mostra "(riposo)".
 
+- `PIPELINE_INFERENCE = True`: le inferenze del frame N girano mentre la CPU
+  elabora il frame N con i risultati del frame N-1; il tempo per frame diventa
+  il massimo tra NPU e CPU invece della somma (un frame di ritardo, ~50 ms).
+- `HANDS_PROCESS_EVERY = 1`: il gesto di aiuto usa sequenze di 15 frame
+  consecutivi, come nel progetto da cui viene il dataset.
+
 Gli FPS del log e dell'HUD sono la media degli intervalli tra frame elaborati.
+
+### Limite segnalazioni
+
+Per ogni zona: lo stesso tipo di allarme al massimo ogni 60 s
+(`EVENT_COOLDOWN_MAP`) e al massimo `ALERT_RATE_LIMIT_COUNT` (10) segnalazioni
+negli ultimi `ALERT_RATE_LIMIT_WINDOW_SECONDS` (600 s). Oltre il tetto gli
+allarmi finiscono solo nel log.
+
+### Gesto di aiuto
+
+Stesso metodo del vecchio progetto Telecamera: MediaPipe Hands (modello
+completo, confidenza 0.7), coordinate dei 21 landmark relative al polso e
+specchiate, sequenze di 15 frame classificate da un RandomForest; l'allarme
+scatta dopo 4 predizioni "aiuto" consecutive. Il dataset
+(`gesture_dataset/dataset_seq.csv`) non è nel repository: copialo nella
+cartella e rigenera il modello con `python train_gesture_classifier.py`
+(crea `gesture_model.pkl`).
+
+### Backend HTTPS
+
+Snapshot e clip vanno a `https://<API_DOMAIN>` (Caddy sul server). La root CA
+locale di Caddy (`<dati caddy>/pki/authorities/local/root.crt`) va copiata nel
+progetto come `caddy_root.crt` (non versionato) per la verifica del certificato.
+
 
 ## Rilevamento coltelli e armi
 
@@ -286,19 +315,19 @@ a distanza ravvicinata (≤ 1-2 m).
 Come decide (`main.py` + `danger_logic.py`):
 
 1. **Soglia per classe** (`WEAPON_CLASS_THRESHOLDS`, `COCO_DANGER_THRESHOLDS`):
-   coltello 0.40 (modello armi) e 0.35 (COCO). Le classi non elencate, come
+   coltello 0.60 (modello armi) e 0.55 (COCO), pistola 0.75, bastone 0.60. Le classi non elencate, come
    `explosion` e `grenade`, sono escluse già prima dell'argmax.
 2. **Bonus mano**: se il box è vicino a un polso rilevato dal modello pose, la
-   soglia scende di `DANGER_HAND_BONUS` (0.10). Con `DANGER_REQUIRE_HAND = True`
+   soglia scende di `DANGER_HAND_BONUS` (0.05). Con `DANGER_REQUIRE_HAND = True`
    contano solo gli oggetti in mano (consigliato quando le persone sono
    inquadrate per intero).
-3. **Conferma a finestra mobile**: nelle ultime `DANGER_WINDOW_SECONDS` (2 s)
-   il coltello deve essere visto per almeno `DANGER_CONFIRM_SECONDS` (1 s), in
-   almeno `DANGER_MIN_HITS` frame e nel `DANGER_MIN_RATIO` (50%) dei frame. Una
+3. **Conferma a finestra mobile**: nelle ultime `DANGER_WINDOW_SECONDS` (2,5 s)
+   il coltello deve essere visto per almeno `DANGER_CONFIRM_SECONDS` (1,5 s), in
+   almeno `DANGER_MIN_HITS` (9) frame e nel `DANGER_MIN_RATIO` (60%) dei frame. Una
    lama che sparisce per qualche frame non azzera la conferma, mentre un falso
    positivo isolato non arriva mai a far scattare l'allarme. La confidenza
    inviata via MQTT è la media della finestra.
-4. `ALERT_MIN_CONF` (0.30) resta solo come rete di sicurezza in `publish_event`.
+4. `ALERT_MIN_CONF` (0.50) resta solo come rete di sicurezza in `publish_event`.
 
 L'HUD mostra "Arma: coltello 65%", cioè quanto manca alla conferma. Sul box
 compare "mano" quando l'oggetto è vicino a un polso.
@@ -372,7 +401,7 @@ L'algoritmo di default è `mmse`. Se l'INT8 perde precisione (`--analyze`),
 
 **4. Orange Pi**: copia `weapon_knife_split.rknn` e in `config.py` imposta
 `WEAPON_RKNN_PATH = "weapon_knife_split.rknn"`, `WEAPON_CLASSES = ["knife", "gun"]`,
-`WEAPON_CLASS_THRESHOLDS = {"knife": 0.40, "gun": 0.50}`. L'input è 640x640 come
-gli altri modelli split: `NPU_INPUT_SIZE = (640, 640)` vale per tutti.
+`WEAPON_CLASS_THRESHOLDS = {"knife": 0.40, "gun": 0.50}`. Converti a 640x640
+come gli altri modelli split (`NPU_INPUT_SIZE = (640, 640)`).
 
 Test della logica di conferma (senza NPU): `python test_danger_logic.py`.

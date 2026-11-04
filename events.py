@@ -59,7 +59,7 @@ def _try_handshake(device_id: Optional[str] = None, backend_url: Optional[str] =
     last_error = None
     for url in unique_endpoints:
         try:
-            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp = requests.get(url, headers=headers, timeout=timeout, verify=getattr(config, "BACKEND_TLS_VERIFY", True))
             if resp.status_code == 200:
                 data = resp.json()
                 zone = data.get("zone", "Zona non specificata")
@@ -169,7 +169,7 @@ def upload_snapshot(frame_or_path: Any, device_id: Optional[str] = None) -> Opti
             filename = f"snapshot_{int(time.time())}.jpg"
 
         files = {"file": (filename, image_bytes, "image/jpeg")}
-        resp = requests.post(url, headers=headers, files=files, timeout=timeout)
+        resp = requests.post(url, headers=headers, files=files, timeout=timeout, verify=getattr(config, "BACKEND_TLS_VERIFY", True))
 
         if resp.status_code == 200:
             data = resp.json()
@@ -211,7 +211,7 @@ def upload_video_clip(clip_path: str, reason: str = "alert", device_id: Optional
                 "event_type": reason,
                 "timestamp": int(time.time()),
             }
-            resp = requests.post(url, headers=headers, files=files, data=data, timeout=timeout)
+            resp = requests.post(url, headers=headers, files=files, data=data, timeout=timeout, verify=getattr(config, "BACKEND_TLS_VERIFY", True))
 
         if resp.status_code == 200:
             result = resp.json()
